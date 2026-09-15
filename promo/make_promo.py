@@ -242,148 +242,134 @@ def put_icon(q: QPainter, rows, x, y):
     return y + img.height()
 
 
-# ───────────── 页面：少字，画面铺满 ─────────────
-
-def canvas() -> tuple[QImage, QPainter]:
-    img = QImage(W, H, QImage.Format.Format_ARGB32)
-    img.fill(WALL)
-    p = QPainter(img)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    return img, p
+def measure(s: str, px: int, max_w: int) -> tuple[int, int]:
+    box = QFontMetrics(font(px, QFont.Weight.Bold)).boundingRect(QRect(0, 0, max_w, 2000), int(Qt.TextFlag.TextWrapAnywhere), s)
+    return box.width() + 44, box.height() + 40
 
 
-def title_box(p: QPainter, s: str, x: int = 60, y: int = 64, px: int = 100):
-    """压在画面左上角的像素小窗口，只放一句标题"""
-    f = font(px)
-    r = QFontMetrics(f).boundingRect(QRect(0, 0, W - 2 * x, 1000), int(Qt.TextFlag.TextWordWrap), s)
-    pad, bar = 30, 34
-    w, h = r.width() + 2 * pad + 6, r.height() + 2 * pad + bar - 10
-    p.fillRect(x + 14, y + 14, w, h, INK)
-    p.fillRect(x, y, w, h, INK)
-    p.fillRect(x + 7, y + bar, w - 14, h - bar - 7, PAPER)
-    text(p, QRect(x + 16, y + 3, 400, 30), "FUNGI.EXE", mono(20), PAPER)
-    for i in range(3):
-        p.setPen(QPen(PAPER, 3))
-        p.drawRect(x + w - 34 - i * 30, y + 8, 18, 18)
-    text(p, QRect(x + pad, y + bar + pad - 18, r.width() + 8, r.height() + 8), s, f)
+# ───────────── 页面：像素窗口 + 一句标题 + 大场景 ─────────────
+
+def framed(bar: str, index: str, title: str, size: int = 118):
+    """上一版的窗口外观；标题下面整块给场景"""
+    img, p = page(bar, index)
+    bottom = headline(p, 128, title, "", size=size)
+    top = bottom + 44
+    return img, p, top
 
 
-def full_scene(base_w: int, base_h: int, zoom: int, seed: int) -> Scene:
-    sc = Scene(base_w, base_h, seed=seed)
+def stage_scene(top: int, zoom: int, seed: int) -> Scene:
+    bottom = H - 36 - 70
+    sc = Scene(900 // zoom, (bottom - top) // zoom, seed=seed)
     sc.Z = zoom
     return sc
 
 
-def overgrow(sc: Scene, steps: int, points: int = 10):
-    rng = random.Random(sc.rng.random())
-    sc.grow([(e, rng.random()) for e in ("top", "right", "bottom", "left") for _ in range(points // 4 + 1)], steps)
+def place(p: QPainter, sc: Scene, top: int):
+    sc.blit(p, (W - sc.w * sc.Z) // 2, top)
+
+
+def edges(sc: Scene, steps: int, per_edge: int = 3, seed: int = 0):
+    rng = random.Random(seed)
+    sc.grow([(e, rng.random()) for e in ("top", "right", "bottom", "left") for _ in range(per_edge)], steps)
     sc.render_mat(full=True)
 
 
-def show(p: QPainter, sc: Scene):
-    sc.ox = sc.oy = 0
-    p.drawPixmap(0, 0, big(sc.img, sc.Z))
-
-
 def cover():
-    img, p = canvas()
-    sc = full_scene(360, 480, 3, seed=31)
-    overgrow(sc, 30000, 16)
+    img, p, top = framed("FUNGI.EXE", "", "我的桌面\n长蘑菇了", size=132)
+    sc = stage_scene(top, 3, seed=31)
+    edges(sc, 22000, 4, seed=2)
     rng = random.Random(8)
     sc.patches = [F.Patch(x, y, r, int(r) + 1, rng.randrange(1 << 30)) for x, y, r in
-                  ((110, 300, 6), (262, 240, 7), (300, 150, 4), (70, 195, 3.5), (180, 360, 3))]
+                  ((70, 90, 5), (215, 120, 7), (140, 40, 3.5), (255, 40, 3))]
     q = sc.begin()
     ground = sc.h - 12
-    draw_spitter(q, sc, 0.9)
-    for pm, x in ((pet(3), 112), (pet(4), 214), (pet(2, blink=True), 306)):
-        feet(q, pm, x, ground)
-    feet(q, pet(1), 262, 240 + 4)
-    feet(q, pet(0, size=4), 110, 300)
+    draw_spitter(q, sc, 0.08)
+    feet(q, pet(3), 62, ground)
+    feet(q, pet(4), 164, ground)
+    feet(q, pet(2, blink=True), 215, 120 + 2)
+    feet(q, pet(0, size=4), 70, 90)
     q.end()
-    show(p, sc)
-    title_box(p, "我的桌面\n长蘑菇了", px=112)
+    place(p, sc, top)
     p.end()
     return img
 
 
 def growth():
-    img, p = canvas()
-    sc = full_scene(540, 720, 2, seed=5)
-    sc.grow([("bottom", x / 10) for x in range(10)], 5200)
+    img, p, top = framed("FUNGI.EXE — 成长", "2 / 7", "从一个黑点开始")
+    sc = stage_scene(top, 2, seed=5)
+    sc.grow([("bottom", x / 10) for x in range(10)], 4800)
     sc.render_mat(full=True)
-    upper = [(pet(0, size=3), 150), (pet(1), 400), (pet(2), 770)]
-    lower = [(pet(3), 270), (pet(4), 770)]
-    ground_up, ground_low = 900, H - 40
-    sc.patches = [F.Patch(int(x / 2), int(ground_up / 2) - 4, r, int(r) + 1, i * 31 + 5)
+    place(p, sc, top)
+    upper_ground, lower_ground = top + 470, top + sc.h * 2 - 24
+    upper = [(pet(0, size=3), 190), (pet(1), 420), (pet(2), 760)]
+    lower = [(pet(3), 300), (pet(4), 740)]
+    sc.patches = [F.Patch(int((x - sc.ox) / 2), int((upper_ground - sc.oy) / 2) - 4, r, int(r) + 1, i * 31 + 5)
                   for i, ((_, x), r) in enumerate(zip(upper, (5, 7.5, 9)))]
     q = sc.begin()
     q.end()
-    show(p, sc)
+    place(p, sc, top)
     for pm, x in upper:
-        feet(p, big(pm, 3), x, ground_up)
+        feet(p, big(pm, 3), x, upper_ground)
     for pm, x in lower:
-        feet(p, big(pm, 3), x, ground_low)
-    title_box(p, "从一个黑点\n开始", px=112)
+        feet(p, big(pm, 3), x, lower_ground)
     p.end()
     return img
 
 
 def feeding():
-    img, p = canvas()
-    sc = full_scene(270, 360, 4, seed=6)
-    sc.grow([("bottom", 0.2), ("bottom", 0.8), ("left", 0.3), ("right", 0.6)], 2600)
+    img, p, top = framed("FUNGI.EXE — 喂食", "3 / 7", "喂它文件")
+    sc = stage_scene(top, 4, seed=6)
+    sc.grow([("bottom", 0.2), ("bottom", 0.8), ("left", 0.4), ("right", 0.5)], 2600)
     sc.render_mat(full=True)
     q = sc.begin()
     ground = sc.h - 12
     young = pet(3, mouth=True)
-    cx = 160
+    cx = 128
     feet(q, young, cx, ground)
     rng = random.Random(4)
     for _ in range(16):
-        a = rng.uniform(-2.8, -0.35)
+        ang = rng.uniform(-2.8, -0.35)
         d = rng.uniform(14, 52)
-        x, y = cx + math.cos(a) * d, ground - young.height() + 14 + math.sin(a) * d
+        x, y = cx + math.cos(ang) * d, ground - young.height() + 14 + math.sin(ang) * d
         q.fillRect(int(x) - 3, int(y) - 3, 6, 6, PAPER)
         q.fillRect(int(x) - 2, int(y) - 2, 4, 4, INK)
-    q.drawImage(34, 150, icon(FOLDER))
-    arc(q, (70, 150), (cx - 4, ground - young.height() - 4), 26, dots=9)
+    q.drawImage(22, 96, icon(FOLDER))
+    arc(q, (56, 96), (cx - 4, ground - young.height() - 4), 26, dots=9)
     doc = icon(DOC)
     q.drawImage(int(cx - 30), int(ground - young.height() - 44), doc.scaled(int(doc.width() * 0.6), int(doc.height() * 0.6)))
     q.end()
-    show(p, sc)
+    place(p, sc, top)
     fx, fy = sc.at(cx, ground - young.height())
-    label(p, "+19", fx + 190, fy - 10, px=84)
-    title_box(p, "喂它文件", px=112)
+    label(p, "+19", fx + 200, fy + 10, px=84)
     p.end()
     return img
 
 
 def overgrown():
-    img, p = canvas()
-    sc = full_scene(360, 480, 3, seed=77)
-    overgrow(sc, 40000, 24)
+    img, p, top = framed("FUNGI.EXE — 菌毯", "4 / 7", "放着不管\n就长满了")
+    sc = stage_scene(top, 3, seed=77)
+    edges(sc, 30000, 6, seed=5)
     rng = random.Random(21)
     spots = []
-    while len(spots) < 9:
-        x, y = rng.uniform(60, 300), rng.uniform(80, 420)
-        if all(math.hypot(x - a, y - b) > 62 for a, b in spots) and not (x < 210 and y < 130) and math.hypot(x - 180, y - 260) > 50:
+    while len(spots) < 8:
+        x, y = rng.uniform(50, sc.w - 50), rng.uniform(45, sc.h - 45)
+        if all(math.hypot(x - a, y - b) > 58 for a, b in spots) and math.hypot(x - sc.w / 2, y - sc.h / 2) > 45:
             spots.append((x, y))
-    sc.patches = [F.Patch(int(x), int(y), rng.uniform(3.5, 8.5), 9, rng.randrange(1 << 30)) for x, y in spots]
+    sc.patches = [F.Patch(int(x), int(y), rng.uniform(3.5, 8), 9, rng.randrange(1 << 30)) for x, y in spots]
     q = sc.begin()
-    feet(q, pet(0, size=3), 180, 270)
+    feet(q, pet(0, size=3), sc.w / 2, sc.h / 2 + 10)
     q.end()
-    show(p, sc)
-    title_box(p, "放着不管\n就长满了", px=112)
+    place(p, sc, top)
     p.end()
     return img
 
 
 def spitter_page():
-    img, p = canvas()
-    sc = full_scene(360, 480, 3, seed=14)
-    sc.grow([("bottom", x / 6) for x in range(6)] + [("left", 0.5), ("right", 0.5)], 6000)
+    img, p, top = framed("FUNGI.EXE — 喷孢菌", "5 / 7", "它会喷孢子")
+    sc = stage_scene(top, 3, seed=14)
+    sc.grow([("bottom", x / 6) for x in range(6)] + [("left", 0.5), ("right", 0.5), ("top", 0.5)], 6000)
     sc.render_mat(full=True)
-    landings = [(70, 250, 5.5), (300, 200, 4.5), (180, 150, 0), (290, 330, 0), (60, 380, 3.5)]
+    landings = [(55, 150, 5.5), (245, 110, 4.5), (150, 70, 0), (240, 230, 0), (60, 260, 3.5)]
     sc.patches = [F.Patch(x, y, r, int(r) + 1, i * 97) for i, (x, y, r) in enumerate(landings) if r]
     q = sc.begin()
     sx, sy = draw_spitter(q, sc, 0.5, "shoot")
@@ -391,53 +377,47 @@ def spitter_page():
         arc(q, (sx, sy), (x, y), 70, dots=14, size=4)
         if not r:
             feet(q, F.art_pixmap(0, 3), x, y + 6)
-    for k in (0.35, 0.6):
-        tx, ty = 300, 200
-        cx, cy = (sx + tx) / 2, min(sy, ty) - 70
-        x = (1 - k) ** 2 * sx + 2 * (1 - k) * k * cx + k * k * tx
-        y = (1 - k) ** 2 * sy + 2 * (1 - k) * k * cy + k * k * ty
-        feet(q, F.art_pixmap(0, 3), x, y)
     q.end()
-    show(p, sc)
-    title_box(p, "它会喷孢子", px=112)
+    place(p, sc, top)
     p.end()
     return img
 
 
 def chat_page():
-    img, p = canvas()
-    sc = full_scene(360, 480, 3, seed=19)
-    sc.grow([("bottom", x / 5) for x in range(5)] + [("left", 0.7)], 3000)
+    img, p, top = framed("FUNGI.EXE — 聊天", "6 / 7", "双击它")
+    sc = stage_scene(top, 3, seed=19)
+    sc.grow([("bottom", x / 5) for x in range(5)] + [("left", 0.7), ("right", 0.3)], 3200)
     sc.render_mat(full=True)
     q = sc.begin()
     ground = sc.h - 12
-    feet(q, pet(4), 180, ground)
+    feet(q, pet(4), sc.w / 2, ground)
     q.end()
-    show(p, sc)
-    ax, ay = sc.at(180, ground - pet(4).height())
-    bubble(p, "我知道你不是真的\n在问蘑菇。", W / 2, ay + 30, px=76, max_w=960)
-    title_box(p, "双击\n它回你一句", px=112)
-    text(p, QRect(W - 260, H - 60, 220, 40), "* 风格示例", font(26, QFont.Weight.Medium), QColor(250, 249, 244, 150), Qt.AlignmentFlag.AlignRight)
+    place(p, sc, top)
+    ux, uy = sc.at(sc.w - 20, 40)
+    uw, uh = measure("你是 AI 吧", 56, 700)
+    bubble(p, "你是 AI 吧", ux - uw / 2, uy + uh, px=56, max_w=700, dark=True, tail=False)
+    ax, ay = sc.at(sc.w / 2, ground - pet(4).height())
+    bubble(p, "我知道你不是真的\n在问蘑菇。", W / 2, ay + 24, px=64, max_w=800)
+    text(p, QRect(96, H - 36 - 62, 500, 40), "* 风格示例", font(26, QFont.Weight.Medium), DUST)
     p.end()
     return img
 
 
 def hunger_page():
-    img, p = canvas()
-    sc = full_scene(360, 480, 3, seed=44)
-    sc.grow([("bottom", 0.25), ("bottom", 0.75)], 500)
+    img, p, top = framed("FUNGI.EXE — 饥饿", "7 / 7", "别忘了喂它")
+    sc = stage_scene(top, 3, seed=44)
+    sc.grow([("bottom", 0.25), ("bottom", 0.75)], 420)
     sc.render_mat(full=True)
     q = sc.begin()
     ground = sc.h - 12
-    for pm, x in ((pet(3, wither=True, mood="starving"), 60), (pet(0, wither=True, mood="dormant"), 126),
-                  (pet(4, wither=True, mood="starving"), 200), (pet(0, wither=True, mood="dormant"), 276),
-                  (pet(1, wither=True, mood="starving"), 326)):
+    for pm, x in ((pet(3, wither=True, mood="starving"), 52), (pet(0, wither=True, mood="dormant"), 116),
+                  (pet(4, wither=True, mood="starving"), 180), (pet(0, wither=True, mood="dormant"), 250),
+                  (pet(1, wither=True, mood="starving"), 274)):
         feet(q, pm, x, ground)
     q.end()
-    show(p, sc)
-    fx, fy = sc.at(200, ground - pet(4).height())
+    place(p, sc, top)
+    fx, fy = sc.at(180, ground - pet(4).height())
     label(p, "咕……", fx, fy - 36, px=64)
-    title_box(p, "别忘了\n喂它", px=112)
     p.end()
     return img
 
