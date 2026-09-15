@@ -797,10 +797,35 @@ class CreatureWidget(QWidget):
 
 # ───────────────────────────── 菌毯 ─────────────────────────────
 
+MAXH = 0xFFFFFFFF
+
+
 def _hash(a: int, b: int = 0) -> int:
-    x = (a * 374761393 + b * 668265263 + 0x9E3779B9) & 0xFFFFFFFF
-    x = ((x ^ (x >> 13)) * 1274126177) & 0xFFFFFFFF
+    x = (a * 374761393 + b * 668265263 + 0x9E3779B9) & MAXH
+    x = ((x ^ (x >> 13)) * 1274126177) & MAXH
     return x ^ (x >> 16)
+
+
+def _vnoise(x: float, seed: int) -> float:
+    """一维值噪声，0..1，平滑、不重复的起伏"""
+    i = math.floor(x)
+    f = x - i
+    f = f * f * (3 - 2 * f)
+    a, b = _hash(i, seed) / MAXH, _hash(i + 1, seed) / MAXH
+    return a + (b - a) * f
+
+
+def _vnoise2(x: float, y: float, seed: int) -> float:
+    """二维值噪声，0..1，用来做成团的斑驳"""
+    ix, iy = math.floor(x), math.floor(y)
+    fx, fy = x - ix, y - iy
+    fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+
+    def h(a, b):
+        return _hash(a * 7919 + b, seed) / MAXH
+    top = h(ix, iy) + (h(ix + 1, iy) - h(ix, iy)) * fx
+    bottom = h(ix, iy + 1) + (h(ix + 1, iy + 1) - h(ix, iy + 1)) * fx
+    return top + (bottom - top) * fy
 
 
 class Mycelium:
@@ -814,6 +839,8 @@ class Mycelium:
             self.d[i] = min(v, MAT_MAX)
         self.active = [i for i, v in enumerate(self.d) if v]
         self.dirty: set[int] = set()
+        self._eff: dict[int, float] = {}
+        self._sprout: dict[int, tuple | None] = {}
 
     # ── 坐标 ──
     def edge_len(self, edge: str) -> int:
@@ -850,7 +877,9 @@ class Mycelium:
         if not self.d[i]:
             self.active.append(i)
         self.d[i] += 1
-        self.dirty.update(j % self.n for j in range(i - 5, i + 6))
+        self.dirty.update(j % self.n for j in range(i - 11, i + 12))
+        self._eff.clear()
+        self._sprout.clear()
         return True
 
     def seed(self, i: int) -> bool:
@@ -884,17 +913,64 @@ class Mycelium:
 
     # ── 绘制用 ──
     def eff(self, i: int) -> float:
-        """平滑后的厚度，带一点稳定的起伏"""
+        """画出来的厚度：平滑后叠加大小两层起伏，满厚的地方也有丘陵和洼地"""
+        i %= self.n
+        if i in self._eff:
+            return self._eff[i]
         d, n = self.d, self.n
-        a, b, c = d[(i - 1) % n], d[i % n], d[(i + 1) % n]
-        if not (a or b or c):
-            return 0.0
-        return max(0.0, (a + 2 * b + c) / 4 + (_hash(i % n) % 3 - 1) * 0.4)
+        a, b, c = d[(i - 1) % n], d[i], d[(i + 1) % n]
+        v = 0.0
+        if a or b or c:
+            base = (a + 2 * b + c) / 4
+            hills = 0.55 + 0.9 * _vnoise(i / 23, 11)
+            bumps = (_vnoise(i / 6.5, 12) - 0.5) * 2.2
+            v = base * hills + bumps * min(1.0, base / 3)
+            if b:
+                v = max(v, 0.8)
+            v = max(0.0, min(MAT_MAX + 0.5, v))
+        self._eff[i] = v
+        return v
 
-    def has_sprout(self, i: int) -> bool:
+    def _sprout_candidate(self, i: int) -> bool:
         i %= self.n
         edge, pos = self.edge_of(i)
-        return self.d[i] >= MAT_SPROUT_DEPTH and _hash(i, 7) % 23 == 0 and 5 <= pos < self.edge_len(edge) - 5
+        if not 6 <= pos < self.edge_len(edge) - 6 or self.d[i] < MAT_SPROUT_DEPTH - _hash(i, 8) % 3:
+            return False
+        return _hash(i, 7) / MAXH < 0.25 * _vnoise(i / 41, 9) ** 2     # 有的地方一小片，有的地方光秃
+
+    def sprout_at(self, i: int) -> tuple[int, bool, int] | None:
+        """第 i 列的小蘑菇：(造型, 是否翻转, 底行离屏幕边几格)；没有则 None"""
+        i %= self.n
+        if i in self._sprout:
+            return self._sprout[i]
+        found = None
+        if self._sprout_candidate(i) and not any(self._sprout_candidate(j) for j in range(i - 5, i)):
+            variants = sprout_variants()
+            v = _hash(i, 21) % len(variants)
+            base = int(self.eff(i)) - 1 - _hash(i, 23) % 3
+            if base + len(variants[v][0]) <= MAT_STRIP:
+                found = (v, bool(_hash(i, 22) & 1), base)
+        self._sprout[i] = found
+        return found
+
+    def tendril(self, j: int) -> list[tuple[int, int]]:
+        """第 j 列伸出去的菌丝：[(列偏移, 离屏幕边几格)]，长短不一、会拐弯，疏密按区域变化"""
+        j %= self.n
+        D = self.eff(j)
+        if D < 2.5:
+            return []
+        hairy = _vnoise(j / 17, 31)
+        if _hash(j, 55) / MAXH >= 0.05 + 0.4 * hairy ** 2:
+            return []
+        cells, off, k0 = [], 0, math.ceil(D)
+        for t in range(1 + _hash(j, 56) % (2 + int(3 * hairy))):
+            r = _hash(j, 60 + t) % 10
+            if t and r < 3:
+                off = max(-2, off - 1)
+            elif t and r > 6:
+                off = min(2, off + 1)
+            cells.append((off, k0 + t))
+        return cells
 
     # ── 存档 ──
     def resized(self, cols: int, rows: int) -> "Mycelium":
@@ -922,24 +998,33 @@ class Mycelium:
 
 
 MAT_INK, MAT_DUST, MAT_PAPER, MAT_HALO = 0xFF111111, 0xFF55524C, 0xFFFAF9F4, 0xC8FAF9F4
+SPROUT_NAMES = ("mat_sprout", "mat_sprout_b", "mat_sprout_c", "mat_sprout_d")
+SPROUT_REACH = 5           # 小蘑菇（含描边）左右最多伸出几列
 
 
 @lru_cache(maxsize=1)
-def sprout_art() -> tuple[tuple[str, ...], dict[str, int]]:
-    drawn = load_pxl("mat_sprout")
-    if drawn:
-        rows, palette = list(drawn[0]), {ch: 0xFF000000 | int(h.lstrip("#"), 16) for ch, h in drawn[1]}
-    else:
-        rows, palette = ["..###..", ".##o##.", "#######", "..#o#..", "..#o#.."], {"#": MAT_INK, "o": MAT_PAPER}
-    return tuple(add_halo(rows)), palette
+def sprout_variants() -> tuple[tuple[tuple[str, ...], dict[str, int]], ...]:
+    out = []
+    for name in SPROUT_NAMES:
+        drawn = load_pxl(name)
+        if drawn:
+            out.append((tuple(add_halo(list(drawn[0]))),
+                        {ch: 0xFF000000 | int(h.lstrip("#"), 16) for ch, h in drawn[1]}))
+    if not out:
+        out.append((tuple(add_halo(["..###..", ".##o##.", "#######", "..#o#..", "..#o#.."])), {"#": MAT_INK, "o": MAT_PAPER}))
+    return tuple(out)
 
 
-def mat_cell(i: int, k: int, D: float, side: float, sprouts: list[tuple[int, int]]) -> int:
+def mat_cell(i: int, k: int, D: float, side: float, sprouts: list, hairs: dict[int, int]) -> int:
     """环形下标 i、离屏幕边 k 格处的颜色（ARGB，0 = 透明）"""
-    art, pal = sprout_art()
-    for delta, base in sprouts:
-        r, c = len(art) - 1 - (k - base), delta + len(art[0]) // 2
-        if 0 <= r < len(art) and 0 <= c < len(art[0]):
+    variants = sprout_variants()
+    for delta, (v, flip, base) in sprouts:
+        art, pal = variants[v]
+        w = len(art[0])
+        r, c = len(art) - 1 - (k - base), delta + w // 2
+        if flip:
+            c = w - 1 - c
+        if 0 <= r < len(art) and 0 <= c < w:
             ch = art[r][c]
             if ch == HALO:
                 if k >= D:
@@ -947,22 +1032,14 @@ def mat_cell(i: int, k: int, D: float, side: float, sprouts: list[tuple[int, int
             elif ch != ".":
                 return pal.get(ch, MAT_INK)
     s = D - k
-    if s > 1.5:                                   # 菌毯本体：黑底，深灰斑驳，白色孢子点
-        h = _hash(i, k + 101)
-        return MAT_PAPER if h % 23 == 0 else MAT_DUST if h % 6 == 0 else MAT_INK
-    if s > 0:                                     # 表面一层黑灰交错
-        return MAT_DUST if (i + k) % 2 else MAT_INK
-    if D >= 3:
-        h = _hash(i, 55)
-        if h % 6 == 0:                            # 伸出去的菌丝
-            tip = 1 + h % 3
-            if s > 1 - tip:
-                return MAT_DUST
-            if s > -tip:
-                return MAT_INK
-            if s > -tip - 1:
-                return MAT_HALO
-            return 0
+    if s > 0:
+        if s <= 0.5 + 1.7 * _vnoise(i / 9, 13):         # 表面一档深灰，宽窄沿边缘变化，偶有黑团顶出
+            return MAT_INK if _vnoise2(i / 2.3, k / 2.3, 17) > 0.66 else MAT_DUST
+        if _hash(i, k + 101) % 37 == 0:                   # 零星白色孢子
+            return MAT_PAPER
+        return MAT_DUST if _vnoise2(i / 3.1, k / 2.4, 41) > 0.7 else MAT_INK   # 成团斑驳
+    if k in hairs:
+        return hairs[k]
     return MAT_HALO if s > -1 or k < side else 0
 
 
@@ -986,12 +1063,23 @@ class MatStrip(QWidget):
     def render_column(self, m: Mycelium, i: int):
         edge, pos = m.edge_of(i)
         n, length, img = m.n, m.edge_len(edge), self.image
+        i %= n
         D = m.eff(i)
         side = max(m.eff(i - 1), m.eff(i + 1))
-        half = len(sprout_art()[0][0]) // 2
-        sprouts = [(delta, int(m.eff(i - delta)) - 2) for delta in range(-half, half + 1) if m.has_sprout(i - delta)]
+        sprouts = []
+        for delta in range(-SPROUT_REACH, SPROUT_REACH + 1):
+            sp = m.sprout_at(i - delta)
+            if sp:
+                sprouts.append((delta, sp))
+        hairs = {}
+        for j in range(i - 2, i + 3):
+            cells = m.tendril(j)
+            for t, (off, k) in enumerate(cells):
+                if (j + off) % n == i:
+                    hairs[k] = MAT_INK if t == len(cells) - 1 else MAT_DUST
+        empty = not (D or side or sprouts or hairs)
         for k in range(MAT_STRIP):
-            argb = mat_cell(i % n, k, D, side, sprouts) if (D or side or sprouts) else 0
+            argb = 0 if empty else mat_cell(i, k, D, side, sprouts, hairs)
             if edge == "top":
                 img.setPixel(pos, k, argb)
             elif edge == "bottom":
@@ -1179,7 +1267,7 @@ class Colony:
     def render_mat(self, full: bool = False):
         m = self.mat
         if full:
-            todo = {j % m.n for i in m.active for j in range(i - 6, i + 7)}
+            todo = {j % m.n for i in m.active for j in range(i - 12, i + 13)}
         else:
             todo = m.dirty
         m.dirty = set()

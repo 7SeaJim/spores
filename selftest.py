@@ -305,7 +305,17 @@ colony6.render_mat(full=True)
 bottom = views["bottom"].image
 painted = sum(1 for x in range(bottom.width()) for y in range(bottom.height()) if bottom.pixel(x, y) >> 24)
 check("渲染出菌毯像素", painted > 0, f"下边 {painted} 格")
-check("厚处冒出小蘑菇", any(mm.has_sprout(i) for i in range(mm.n)))
+check("厚处冒出小蘑菇", any(mm.sprout_at(i) for i in range(mm.n)))
+full = F.Mycelium(480, 263, bytes([F.MAT_MAX] * (2 * (480 + 263))))
+profile = [full.eff(i) for i in range(full.n)]
+check("铺满的地方也有高低起伏", max(profile) - min(profile) >= 3, f"{min(profile):.1f}–{max(profile):.1f} 格")
+spots = [(i, full.sprout_at(i)) for i in range(full.n) if full.sprout_at(i)]
+gaps = [b[0] - a[0] for a, b in zip(spots, spots[1:])]
+mean_gap = sum(gaps) / len(gaps)
+spread = (sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)) ** 0.5 / mean_gap
+check("小蘑菇多种造型、会翻转、不挤在一起", len({sp[0] for _, sp in spots}) >= 3 and len({sp[1] for _, sp in spots}) == 2 and min(gaps) >= 6,
+      f"{len(spots)} 个，{len({sp[0] for _, sp in spots})} 种")
+check("小蘑菇间距长短不一（不是等距排列）", spread > 0.5, f"间距 {min(gaps)}–{max(gaps)}，离散系数 {spread:.2f}")
 colony6.save()
 snap_mat = bytes(mm.d)
 shutdown(colony6)
