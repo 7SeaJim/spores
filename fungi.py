@@ -89,8 +89,8 @@ MAT_SPROUT_DEPTH = 6       # 菌毯厚到多少格才会冒小蘑菇
 
 # 喷孢菌：菌毯占到一定范围后长出来，不会动，定期往随机处喷孢子
 SPITTER_AT = 0.25          # 屏幕边缘一圈被菌毯占到多少长度时长出来
-SPITTER_EVERY = (60, 150)  # 喷射间隔（秒）
-SHOT_OUTCOMES = (("vanish", 0.50), ("mat", 0.35), ("spore", 0.15))   # 落地：消失 / 形成菌毯 / 变成独立小孢子
+SPITTER_EVERY = (300, 600) # 喷射间隔（秒），5–10 分钟
+SHOT_OUTCOMES = (("vanish", 0.75), ("mat", 0.20), ("spore", 0.05))   # 落地：消失 / 形成菌毯 / 变成独立小孢子
 PATCH_MAX = (3, 7)         # 桌面中间的菌斑最多长到多大半径（格），每块随机
 PATCH_GROW = 0.04          # 菌斑每次（MAT_TICK）长多少格半径
 MAX_PATCHES = 30

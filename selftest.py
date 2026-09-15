@@ -403,7 +403,7 @@ rng = random.Random(7)
 counts = {k: 0 for k in F.OUTCOME_NAMES}
 for _ in range(20000):
     counts[colony9.pick_outcome(rng)] += 1
-check("落地结果概率 ≈ 消失 50% / 菌毯 35% / 孢子 15%",
+check("落地结果概率 ≈ " + " / ".join(f"{F.OUTCOME_NAMES[k]} {p:.0%}" for k, p in F.SHOT_OUTCOMES),
       all(abs(counts[k] / 20000 - p) < 0.02 for k, p in F.SHOT_OUTCOMES), str(counts))
 
 colony9.plant_spitter(m9.index_at("bottom", m9.cols // 2), quiet=True)
