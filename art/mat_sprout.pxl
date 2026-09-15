@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "size": [7, 7],
+  "palette": {
+    ".": null,
+    "k": "#111111",
+    "w": "#faf9f4",
+    "g": "#c8c3b6",
+    "d": "#55524c"
+  },
+  "rows": [
+    "..kkk..",
+    ".kdkwk.",
+    "kkkkkkk",
+    ".kgggk.",
+    "..kwk..",
+    "..kwk..",
+    "..kgk.."
+  ]
+}

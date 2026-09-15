@@ -16,6 +16,7 @@ FUNGI.EXE — 桌面真菌宠物（最小闭环 demo）
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
@@ -30,7 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
-from PyQt6.QtGui import (QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon,
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
@@ -74,6 +75,17 @@ IDLE_WEIGHTS = {           # 阶段: [(动作, 权重)]
     3: [("tilt", 3), ("hop", 1), ("blink2", 2)],
     4: [("tilt", 3), ("hop", 1), ("blink2", 2), ("puff", 3)],
 }
+
+# 菌毯（沿桌面可用区域的四条边生长）
+MAT_MAX = 8                # 最厚多少格（每格 PX 像素，8 格 = 32px）
+MAT_STRIP = MAT_MAX + 7    # 边缘窗口厚度（格）：菌毯 + 菌丝 + 小蘑菇，共 60px
+MAT_TICK = 5.0             # 每隔多少秒长一次
+MAT_VIGOR = (0.3, 0.6, 1.0, 1.5, 2.5)   # 各阶段的活力
+MAT_SEED = 0.03            # 每次、每单位活力，在离它最近的边缘落孢子的概率
+MAT_RATE = 0.35            # 每次、每单位活力的生长步数
+MAT_FEED = 0.5             # 喂食时每 1 营养让最近那段菌毯多长几步
+MAT_OFFLINE_CAP = 20000    # 关闭期间最多补长多少步
+MAT_SPROUT_DEPTH = 6       # 菌毯厚到多少格才会冒小蘑菇
 
 EDIBLE_EXT = {".txt", ".md"}
 MAX_ITEMS_PER_DROP = 5
@@ -783,6 +795,218 @@ class CreatureWidget(QWidget):
         self.colony.show_menu(self, e.globalPos())
 
 
+# ───────────────────────────── 菌毯 ─────────────────────────────
+
+def _hash(a: int, b: int = 0) -> int:
+    x = (a * 374761393 + b * 668265263 + 0x9E3779B9) & 0xFFFFFFFF
+    x = ((x ^ (x >> 13)) * 1274126177) & 0xFFFFFFFF
+    return x ^ (x >> 16)
+
+
+class Mycelium:
+    """屏幕边缘一圈菌毯的厚度（格）。环形下标：上边左→右、右边上→下、下边右→左、左边下→上。"""
+
+    def __init__(self, cols: int, rows: int, depth: bytes | None = None):
+        self.cols, self.rows = max(1, cols), max(1, rows)
+        self.n = 2 * (self.cols + self.rows)
+        self.d = bytearray(depth) if depth is not None and len(depth) == self.n else bytearray(self.n)
+        for i, v in enumerate(self.d):
+            self.d[i] = min(v, MAT_MAX)
+        self.active = [i for i, v in enumerate(self.d) if v]
+        self.dirty: set[int] = set()
+
+    # ── 坐标 ──
+    def edge_len(self, edge: str) -> int:
+        return self.cols if edge in ("top", "bottom") else self.rows
+
+    def edge_of(self, i: int) -> tuple[str, int]:
+        c, r = self.cols, self.rows
+        i %= self.n
+        if i < c:
+            return "top", i
+        if i < c + r:
+            return "right", i - c
+        if i < 2 * c + r:
+            return "bottom", i - c - r
+        return "left", i - 2 * c - r
+
+    def index_at(self, edge: str, pos: int) -> int:
+        c, r = self.cols, self.rows
+        return {"top": 0, "right": c, "bottom": c + r, "left": 2 * c + r}[edge] + pos
+
+    def nearest(self, cx: float, cy: float) -> int:
+        """离格坐标 (cx, cy) 最近的边缘格"""
+        c, r = self.cols, self.rows
+        x, y = int(min(max(cx, 0), c - 1)), int(min(max(cy, 0), r - 1))
+        dist = {"top": y, "bottom": r - 1 - y, "left": x, "right": c - 1 - x}
+        edge = min(dist, key=dist.get)
+        return self.index_at(edge, {"top": x, "right": y, "bottom": c - 1 - x, "left": r - 1 - y}[edge])
+
+    # ── 生长 ──
+    def bump(self, i: int) -> bool:
+        i %= self.n
+        if self.d[i] >= MAT_MAX:
+            return False
+        if not self.d[i]:
+            self.active.append(i)
+        self.d[i] += 1
+        self.dirty.update(j % self.n for j in range(i - 5, i + 6))
+        return True
+
+    def seed(self, i: int) -> bool:
+        """落下孢子：这一格还没有菌毯时长出第一格"""
+        i %= self.n
+        return not self.d[i] and self.bump(i)
+
+    def grow(self, steps: int, near: int | None = None, rng=random):
+        """随机挑已有菌毯的格：比邻格厚 2 格以上就往旁边蔓延，否则原地增厚（越厚越慢）"""
+        d, n = self.d, self.n
+        for _ in range(steps):
+            if not self.active:
+                return
+            i = None
+            if near is not None:
+                for _ in range(6):
+                    j = (near + int(rng.gauss(0, 25))) % n
+                    if d[j]:
+                        i = j
+                        break
+            if i is None:
+                i = rng.choice(self.active)
+            j = (i + rng.choice((-1, 1)) * rng.choice((1, 1, 1, 2))) % n
+            if d[j] + 1 < d[i]:
+                self.bump(j)
+            elif rng.random() < 1 - d[i] / MAT_MAX:
+                self.bump(i)
+
+    def coverage(self) -> float:
+        return sum(self.d) / (self.n * MAT_MAX)
+
+    # ── 绘制用 ──
+    def eff(self, i: int) -> float:
+        """平滑后的厚度，带一点稳定的起伏"""
+        d, n = self.d, self.n
+        a, b, c = d[(i - 1) % n], d[i % n], d[(i + 1) % n]
+        if not (a or b or c):
+            return 0.0
+        return max(0.0, (a + 2 * b + c) / 4 + (_hash(i % n) % 3 - 1) * 0.4)
+
+    def has_sprout(self, i: int) -> bool:
+        i %= self.n
+        edge, pos = self.edge_of(i)
+        return self.d[i] >= MAT_SPROUT_DEPTH and _hash(i, 7) % 23 == 0 and 5 <= pos < self.edge_len(edge) - 5
+
+    # ── 存档 ──
+    def resized(self, cols: int, rows: int) -> "Mycelium":
+        """屏幕分辨率变了：每条边按比例重新采样"""
+        if (cols, rows) == (self.cols, self.rows):
+            return self
+        new = Mycelium(cols, rows)
+        for i in range(new.n):
+            edge, pos = new.edge_of(i)
+            old = min(self.edge_len(edge) - 1, pos * self.edge_len(edge) // new.edge_len(edge))
+            new.d[i] = self.d[self.index_at(edge, old)]
+        new.active = [i for i, v in enumerate(new.d) if v]
+        return new
+
+    def to_json(self) -> dict:
+        return {"cols": self.cols, "rows": self.rows, "depth": base64.b64encode(bytes(self.d)).decode()}
+
+    @classmethod
+    def from_json(cls, data) -> "Mycelium | None":
+        try:
+            m = cls(int(data["cols"]), int(data["rows"]), base64.b64decode(data["depth"]))
+        except (TypeError, KeyError, ValueError):
+            return None
+        return m if len(m.d) == m.n else None
+
+
+MAT_INK, MAT_DUST, MAT_PAPER, MAT_HALO = 0xFF111111, 0xFF55524C, 0xFFFAF9F4, 0xC8FAF9F4
+
+
+@lru_cache(maxsize=1)
+def sprout_art() -> tuple[tuple[str, ...], dict[str, int]]:
+    drawn = load_pxl("mat_sprout")
+    if drawn:
+        rows, palette = list(drawn[0]), {ch: 0xFF000000 | int(h.lstrip("#"), 16) for ch, h in drawn[1]}
+    else:
+        rows, palette = ["..###..", ".##o##.", "#######", "..#o#..", "..#o#.."], {"#": MAT_INK, "o": MAT_PAPER}
+    return tuple(add_halo(rows)), palette
+
+
+def mat_cell(i: int, k: int, D: float, side: float, sprouts: list[tuple[int, int]]) -> int:
+    """环形下标 i、离屏幕边 k 格处的颜色（ARGB，0 = 透明）"""
+    art, pal = sprout_art()
+    for delta, base in sprouts:
+        r, c = len(art) - 1 - (k - base), delta + len(art[0]) // 2
+        if 0 <= r < len(art) and 0 <= c < len(art[0]):
+            ch = art[r][c]
+            if ch == HALO:
+                if k >= D:
+                    return MAT_HALO
+            elif ch != ".":
+                return pal.get(ch, MAT_INK)
+    s = D - k
+    if s > 1.5:                                   # 菌毯本体：黑底，深灰斑驳，白色孢子点
+        h = _hash(i, k + 101)
+        return MAT_PAPER if h % 23 == 0 else MAT_DUST if h % 6 == 0 else MAT_INK
+    if s > 0:                                     # 表面一层黑灰交错
+        return MAT_DUST if (i + k) % 2 else MAT_INK
+    if D >= 3:
+        h = _hash(i, 55)
+        if h % 6 == 0:                            # 伸出去的菌丝
+            tip = 1 + h % 3
+            if s > 1 - tip:
+                return MAT_DUST
+            if s > -tip:
+                return MAT_INK
+            if s > -tip - 1:
+                return MAT_HALO
+            return 0
+    return MAT_HALO if s > -1 or k < side else 0
+
+
+class MatStrip(QWidget):
+    """屏幕一条边上的菌毯窗口：透明、鼠标穿透、不抢焦点。image 每像素 = 1 格。"""
+
+    def __init__(self, edge: str, rect: QRect, layer: str):
+        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput
+                 | Qt.WindowType.NoDropShadowWindowHint)
+        flags |= Qt.WindowType.WindowStaysOnTopHint if layer == "top" else Qt.WindowType.WindowStaysOnBottomHint
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setWindowTitle(f"fungi · mat {edge}")
+        self.edge = edge
+        self.setGeometry(rect)
+        self.image = QImage(rect.width() // PX, rect.height() // PX, QImage.Format.Format_ARGB32)
+        self.image.fill(Qt.GlobalColor.transparent)
+
+    def render_column(self, m: Mycelium, i: int):
+        edge, pos = m.edge_of(i)
+        n, length, img = m.n, m.edge_len(edge), self.image
+        D = m.eff(i)
+        side = max(m.eff(i - 1), m.eff(i + 1))
+        half = len(sprout_art()[0][0]) // 2
+        sprouts = [(delta, int(m.eff(i - delta)) - 2) for delta in range(-half, half + 1) if m.has_sprout(i - delta)]
+        for k in range(MAT_STRIP):
+            argb = mat_cell(i % n, k, D, side, sprouts) if (D or side or sprouts) else 0
+            if edge == "top":
+                img.setPixel(pos, k, argb)
+            elif edge == "bottom":
+                img.setPixel(length - 1 - pos, MAT_STRIP - 1 - k, argb)
+            elif edge == "right":
+                img.setPixel(MAT_STRIP - 1 - k, pos, argb)
+            else:
+                img.setPixel(k, length - 1 - pos, argb)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.drawImage(self.rect(), self.image)
+        p.end()
+
+
 # ───────────────────────────── 菌落（存档、生长、繁殖） ─────────────────────────────
 
 class Colony:
@@ -797,8 +1021,15 @@ class Colony:
         self.name_i = 0
         self.on_top = True
         self.last_tick = time.time()
+        self.mat: Mycelium | None = None
+        self.mat_layer = "top"
+        self.mat_views: dict[str, MatStrip] = {}
+        self.mat_acc = 0.0
+        self.offline_elapsed = 0.0
 
         offline = self.load()
+        self.grow_mat_offline(self.offline_elapsed)
+        self.build_mat_views()
         for c in self.creatures:
             self.spawn_widget(c)
         for c in list(self.creatures):
@@ -845,11 +1076,18 @@ class Colony:
                 self.save_path.rename(broken)
                 print(f"[fungi] 存档损坏，已备份到 {broken}: {err}", file=sys.stderr)
         offline = 0.0
+        a = self.mat_area()
+        self.mat = Mycelium(a.width() // PX, a.height() // PX)
         if data:
             self.name_i = data.get("name_i", 0)
             self.on_top = data.get("on_top", True)
+            self.mat_layer = data.get("mat_layer", "top")
+            saved_mat = Mycelium.from_json(data.get("mat"))
+            if saved_mat:
+                self.mat = saved_mat.resized(self.mat.cols, self.mat.rows)
             self.creatures = [Creature.from_dict(d) for d in data.get("creatures", [])]
             elapsed = time.time() - data.get("last_seen", time.time())
+            self.offline_elapsed = max(0.0, elapsed)
             offline = min(OFFLINE_CAP, max(0.0, elapsed) * self.passive_mult / PASSIVE_SECONDS)
             for c in self.creatures:
                 c.nutrition += offline
@@ -862,6 +1100,7 @@ class Colony:
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top,
+                "mat_layer": self.mat_layer, "mat": self.mat.to_json(),
                 "creatures": [asdict(c) for c in self.creatures]}
         tmp = self.save_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
@@ -883,6 +1122,100 @@ class Colony:
             c.nutrition += dt * self.passive_mult / PASSIVE_SECONDS
             if c.stage != before or c.spores_due() > 0:
                 self.after_growth(self.widgets[c.id], before)
+        self.mat_acc += dt * self.passive_mult
+        while self.mat_acc >= MAT_TICK:
+            self.mat_acc -= MAT_TICK
+            self.mat_step()
+        if self.mat.dirty:
+            self.render_mat()
+
+    # ── 菌毯 ──
+    def mat_area(self) -> QRect:
+        screen = QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
+
+    def mat_index(self, c: Creature) -> int:
+        a = self.mat_area()
+        return self.mat.nearest((c.x - a.x()) / PX, (c.y - a.y()) / PX)
+
+    def mat_step(self):
+        vigor = 0.0
+        for c in self.creatures:
+            v = MAT_VIGOR[c.stage]
+            vigor += v
+            if random.random() < MAT_SEED * v and self.mat.seed(self.mat_index(c)):
+                w = self.widgets.get(c.id)
+                if w and c.stage and not w.asleep:
+                    w.puff(2)
+        budget = MAT_RATE * vigor
+        self.mat.grow(int(budget) + (random.random() < budget % 1))
+
+    def grow_mat_offline(self, elapsed: float):
+        steps = elapsed * self.passive_mult / MAT_TICK
+        if steps < 1:
+            return
+        for c in self.creatures:
+            if random.random() < 1 - (1 - MAT_SEED * MAT_VIGOR[c.stage]) ** steps:
+                self.mat.seed(self.mat_index(c))
+        vigor = sum(MAT_VIGOR[c.stage] for c in self.creatures)
+        self.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * vigor)))
+
+    def build_mat_views(self):
+        for v in self.mat_views.values():
+            v.close()
+        self.mat_views = {}
+        if self.mat_layer != "hidden":
+            a, m, t = self.mat_area(), self.mat, MAT_STRIP * PX
+            w, h = m.cols * PX, m.rows * PX
+            rects = {"top": QRect(a.x(), a.y(), w, t), "bottom": QRect(a.x(), a.y() + h - t, w, t),
+                     "left": QRect(a.x(), a.y(), t, h), "right": QRect(a.x() + w - t, a.y(), t, h)}
+            self.mat_views = {edge: MatStrip(edge, rect, self.mat_layer) for edge, rect in rects.items()}
+            self.render_mat(full=True)
+            for v in self.mat_views.values():
+                v.show()
+        for w in self.widgets.values():
+            w.raise_()
+
+    def render_mat(self, full: bool = False):
+        m = self.mat
+        if full:
+            todo = {j % m.n for i in m.active for j in range(i - 6, i + 7)}
+        else:
+            todo = m.dirty
+        m.dirty = set()
+        if not self.mat_views:
+            return
+        touched = set()
+        for i in todo:
+            edge = m.edge_of(i)[0]
+            self.mat_views[edge].render_column(m, i)
+            touched.add(edge)
+        for edge in touched:
+            self.mat_views[edge].update()
+
+    def set_mat_layer(self, layer: str):
+        self.mat_layer = layer
+        self.build_mat_views()
+        self.save()
+
+    def mat_menu(self, parent: QMenu) -> QMenu:
+        sub = parent.addMenu("菌毯")
+        sub.setStyleSheet(MENU_QSS)
+        group = QActionGroup(sub)
+        for key, label in (("top", "铺在窗口上面"), ("bottom", "只铺在桌面上"), ("hidden", "隐藏")):
+            act = sub.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self.mat_layer == key)
+            act.triggered.connect(lambda _=False, k=key: self.set_mat_layer(k))
+            group.addAction(act)
+
+        def refresh():
+            sub.setTitle(f"菌毯  {self.mat.coverage() * 100:.1f}%")
+            for act, key in zip(group.actions(), ("top", "bottom", "hidden")):
+                act.setChecked(self.mat_layer == key)
+        refresh()
+        parent.aboutToShow.connect(refresh)
+        return sub
 
     def feed(self, widget: CreatureWidget, paths: list[Path]):
         c = widget.c
@@ -904,6 +1237,9 @@ class Colony:
             c.feeds += 1
             c.log = (c.log + [[int(time.time()), food.label, value]])[-50:]
             eaten.append((value, note))
+        if eaten and self.mat.active:
+            self.mat.grow(int(sum(v for v, _ in eaten) * MAT_FEED), near=self.mat_index(c))
+            self.render_mat()
         if len(paths) > MAX_ITEMS_PER_DROP:
             rejected.append("吃不下了")
 
@@ -998,6 +1334,7 @@ class Colony:
         top.setChecked(self.on_top)
         top.toggled.connect(self.set_on_top)
         m.addAction("叫大家回来", self.gather)
+        self.mat_menu(m)
         if len(self.creatures) > 1:
             m.addAction(f"放生 {c.name}…", lambda: self.release(widget))
         m.addSeparator()
@@ -1048,6 +1385,8 @@ class Colony:
             w.close()
         self.widgets.clear()
         self.creatures, self.name_i = [], 0
+        self.mat = Mycelium(self.mat.cols, self.mat.rows)
+        self.build_mat_views()
         c = self.new_creature(*self.default_spot())
         self.creatures.append(c)
         self.spawn_widget(c)
@@ -1061,6 +1400,7 @@ class Colony:
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
         m.addAction("叫大家回来", self.gather)
+        self.mat_menu(m)
         m.addAction(f"存档位置：{self.save_path}").setEnabled(False)
         m.addAction("重新开始…", self.reset)
         m.addSeparator()

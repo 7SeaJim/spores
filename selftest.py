@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import random
 import os
 import shutil
 import sys
@@ -47,6 +48,8 @@ def shutdown(colony):
     for w in colony.widgets.values():
         w.timer.stop()
         w.close()
+    for v in colony.mat_views.values():
+        v.close()
 
 
 def drag(widget, paths, actions):
@@ -263,6 +266,86 @@ for g in grabs:
     x += g.width() + 16
 ip.end()
 
+print("10. 菌毯")
+m = F.Mycelium(40, 30)
+check("环形坐标往返", all(m.index_at(*m.edge_of(i)) == i for i in range(m.n)))
+check("最近的边：上 / 右 / 下 / 左",
+      m.edge_of(m.nearest(20, 1)) == ("top", 20) and m.edge_of(m.nearest(38, 15)) == ("right", 15)
+      and m.edge_of(m.nearest(10, 29)) == ("bottom", 29) and m.edge_of(m.nearest(0, 5)) == ("left", 24))
+check("落孢子长出第一格", m.seed(m.nearest(20, 1)) and m.d[20] == 1)
+check("已有菌毯处不重复落孢子", not m.seed(20))
+m.grow(1500, rng=random.Random(1))
+arcs = sum(1 for i in range(m.n) if m.d[i] and not m.d[i - 1])
+check("从落点连续蔓延，没有飞地", arcs <= 1, f"{arcs} 段")
+check(f"厚度不超过 {F.MAT_MAX} 格", max(m.d) <= F.MAT_MAX)
+check("落点附近比蔓延前沿厚", sum(m.d[18:23]) / 5 > sum(m.d[i] for i in range(m.n) if 0 < m.d[i] <= 2) / max(1, sum(1 for v in m.d if 0 < v <= 2)))
+m2 = F.Mycelium(100, 60)
+for i in (10, 200):
+    m2.seed(i)
+m2.grow(40, rng=random.Random(2))
+m2.grow(800, near=10, rng=random.Random(2))
+check("喂食时最近那段长得多", sum(m2.d[0:40]) > 2 * sum(m2.d[180:220]), f"{sum(m2.d[0:40])} vs {sum(m2.d[180:220])}")
+m3 = m.resized(80, 60)
+check("换分辨率按比例重采样", m3.n == 280 and abs(m3.coverage() - m.coverage()) < 0.05)
+check("存档往返一致", bytes(F.Mycelium.from_json(json.loads(json.dumps(m.to_json()))).d) == bytes(m.d))
+check("旧存档里超厚的数据被截到上限", max(F.Mycelium(40, 30, bytes([30] * 140)).d) == F.MAT_MAX)
+
+colony6 = F.Colony(root / "mat")
+views = colony6.mat_views
+check("四条边各一个菌毯窗口", set(views) == {"top", "right", "bottom", "left"})
+check("菌毯窗口鼠标穿透", all(v.windowFlags() & Qt.WindowType.WindowTransparentForInput for v in views.values()))
+strip_px = F.MAT_STRIP * F.PX
+check(f"边框窗口厚 {strip_px}px（菌毯最厚 {F.MAT_MAX * F.PX}px）",
+      strip_px <= 60 and all(min(v.width(), v.height()) == strip_px for v in views.values()))
+mm = colony6.mat
+for x, y in ((mm.cols * 0.7, mm.rows), (0, mm.rows * 0.3), (mm.cols * 0.2, 0), (mm.cols, mm.rows * 0.8)):
+    mm.seed(mm.nearest(x, y))
+mm.grow(5000, rng=random.Random(3))
+colony6.render_mat(full=True)
+bottom = views["bottom"].image
+painted = sum(1 for x in range(bottom.width()) for y in range(bottom.height()) if bottom.pixel(x, y) >> 24)
+check("渲染出菌毯像素", painted > 0, f"下边 {painted} 格")
+check("厚处冒出小蘑菇", any(mm.has_sprout(i) for i in range(mm.n)))
+colony6.save()
+snap_mat = bytes(mm.d)
+shutdown(colony6)
+colony7 = F.Colony(root / "mat")
+check("读档后菌毯一致", bytes(colony7.mat.d) == snap_mat)
+shutdown(colony7)
+raw = json.loads((root / "mat" / "save.json").read_text())
+raw["last_seen"] -= 5 * 3600
+raw["mat"] = F.Mycelium(mm.cols, mm.rows).to_json()
+m_seedless = F.Mycelium(mm.cols, mm.rows)
+m_seedless.seed(5)
+raw["mat"] = m_seedless.to_json()
+(root / "mat" / "save.json").write_text(json.dumps(raw))
+colony8 = F.Colony(root / "mat")
+check("关掉 5 小时回来菌毯长了", colony8.mat.coverage() > m_seedless.coverage(), f"{colony8.mat.coverage():.3f}")
+colony8.mat.grow(4000, rng=random.Random(4))
+colony8.render_mat(full=True)
+
+
+def screen_shot(colony, bg):
+    a = colony.mat_area()
+    shot = QImage(a.x() + a.width(), a.y() + a.height(), QImage.Format.Format_ARGB32)
+    shot.fill(bg)
+    sp = QPainter(shot)
+    for v in colony.mat_views.values():
+        sp.drawImage(v.geometry(), v.image)
+    for w in colony.widgets.values():
+        sp.drawPixmap(w.pos(), w.grab())
+    sp.end()
+    return shot
+
+
+mat_light = screen_shot(colony8, QColor(250, 249, 244))
+mat_dark = screen_shot(colony8, QColor(38, 56, 74))
+colony8.set_mat_layer("hidden")
+check("隐藏菌毯：窗口关掉但继续长", not colony8.mat_views and colony8.mat.active)
+colony8.set_mat_layer("bottom")
+check("只铺在桌面层", all(v.windowFlags() & Qt.WindowType.WindowStaysOnBottomHint for v in colony8.mat_views.values()))
+shutdown(colony8)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
@@ -282,6 +365,8 @@ p.end()
 out_dir.mkdir(parents=True, exist_ok=True)
 img.save(str(out_dir / "widgets.png"))
 iimg.save(str(out_dir / "idle.png"))
+mat_light.save(str(out_dir / "mat_light.png"))
+mat_dark.save(str(out_dir / "mat_dark.png"))
 print(f"\n预览图: {out_dir / 'widgets.png'}")
 shutil.rmtree(root, ignore_errors=True)
 print("全部通过" if not failures else f"{failures} 项失败")
