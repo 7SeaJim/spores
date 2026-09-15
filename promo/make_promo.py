@@ -242,312 +242,298 @@ def put_icon(q: QPainter, rows, x, y):
     return y + img.height()
 
 
-# ───────────── 页面 ─────────────
+# ───────────── 页面：少字，画面铺满 ─────────────
+
+def canvas() -> tuple[QImage, QPainter]:
+    img = QImage(W, H, QImage.Format.Format_ARGB32)
+    img.fill(WALL)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    return img, p
+
+
+def title_box(p: QPainter, s: str, x: int = 60, y: int = 64, px: int = 100):
+    """压在画面左上角的像素小窗口，只放一句标题"""
+    f = font(px)
+    r = QFontMetrics(f).boundingRect(QRect(0, 0, W - 2 * x, 1000), int(Qt.TextFlag.TextWordWrap), s)
+    pad, bar = 30, 34
+    w, h = r.width() + 2 * pad + 6, r.height() + 2 * pad + bar - 10
+    p.fillRect(x + 14, y + 14, w, h, INK)
+    p.fillRect(x, y, w, h, INK)
+    p.fillRect(x + 7, y + bar, w - 14, h - bar - 7, PAPER)
+    text(p, QRect(x + 16, y + 3, 400, 30), "FUNGI.EXE", mono(20), PAPER)
+    for i in range(3):
+        p.setPen(QPen(PAPER, 3))
+        p.drawRect(x + w - 34 - i * 30, y + 8, 18, 18)
+    text(p, QRect(x + pad, y + bar + pad - 18, r.width() + 8, r.height() + 8), s, f)
+
+
+def full_scene(base_w: int, base_h: int, zoom: int, seed: int) -> Scene:
+    sc = Scene(base_w, base_h, seed=seed)
+    sc.Z = zoom
+    return sc
+
+
+def overgrow(sc: Scene, steps: int, points: int = 10):
+    rng = random.Random(sc.rng.random())
+    sc.grow([(e, rng.random()) for e in ("top", "right", "bottom", "left") for _ in range(points // 4 + 1)], steps)
+    sc.render_mat(full=True)
+
+
+def show(p: QPainter, sc: Scene):
+    sc.ox = sc.oy = 0
+    p.drawPixmap(0, 0, big(sc.img, sc.Z))
+
 
 def cover():
-    img, p = page("FUNGI.EXE")
-    headline(p, 130, "我的桌面\n长蘑菇了", "一只吃「未整理文件」的像素宠物", size=118)
-    sc = Scene(444, 372, seed=3)
-    sc.grow([("bottom", 0.3), ("bottom", 0.8), ("left", 0.45), ("top", 0.25), ("right", 0.6), ("top", 0.75)], 3200)
-    sc.render_mat(full=True)
-    sc.patches = [F.Patch(370, 118, 4.5, 5, 11)]
+    img, p = canvas()
+    sc = full_scene(360, 480, 3, seed=31)
+    overgrow(sc, 30000, 16)
+    rng = random.Random(8)
+    sc.patches = [F.Patch(x, y, r, int(r) + 1, rng.randrange(1 << 30)) for x, y, r in
+                  ((110, 300, 6), (262, 240, 7), (300, 150, 4), (70, 195, 3.5), (180, 360, 3))]
     q = sc.begin()
-    labels = [(FOLDER, "新建文件夹(3)", 85, 48), (DOC, "最终版_真的\n最终_v7.md", 205, 44), (FOLDER, "资料归档", 80, 150)]
-    ends = [put_icon(q, rows, x, y) for rows, _, x, y in labels]
-    ground = sc.h - 16
-    sx, sy = draw_spitter(q, sc, 0.86)
-    arc(q, (sx, sy), (370, 118), 70)
-    for pm, x, dy in ((pet(3, mood="hungry"), 162, 2), (pet(4), 268, 0), (pet(2, blink=True), 362, 0), (pet(1), 414, -2)):
-        feet(q, pm, x, ground + dy)
+    ground = sc.h - 12
+    draw_spitter(q, sc, 0.9)
+    for pm, x in ((pet(3), 112), (pet(4), 214), (pet(2, blink=True), 306)):
+        feet(q, pm, x, ground)
+    feet(q, pet(1), 262, 240 + 4)
+    feet(q, pet(0, size=4), 110, 300)
     q.end()
-    sc.blit(p, (W - sc.w * 2) // 2, 620)
-    for (_, name, x, y), end in zip(labels, ends):
-        icon_label(p, sc, name, x, end + 2)
-    ax, ay = sc.at(268, ground - pet(4).height())
-    bubble(p, "你其实不是想删掉它，\n你是想有人替你留着。", ax, ay + 16, px=32, max_w=520)
+    show(p, sc)
+    title_box(p, "我的桌面\n长蘑菇了", px=112)
     p.end()
     return img
 
 
 def growth():
-    img, p = page("FUNGI.EXE — 成长", "2 / 7")
-    headline(p, 140, "从一个 3×3 的\n小黑点开始", "拖文件喂它，一路长成会放孢子的蘑菇", size=96)
-    items = [(pet(0, size=3), "spores", "3×3 黑点"), (pet(1), "sprout", "冒出菌盖"), (pet(2), "baby", "豆子身体"),
-             (pet(3), "young", "长出手脚"), (pet(4), "adult", "放出孢子")]
-    pms = [big(pm, 2) for pm, _, _ in items]
-    slots = [max(140, pm.width()) for pm in pms]
-    x, ground = (W - sum(slots)) / 2, 880
-    for pm, slot, (_, name, cap) in zip(pms, slots, items):
-        cx = x + slot / 2
-        feet(p, pm, cx, ground)
-        text(p, QRect(int(cx - slot / 2), ground + 22, slot, 50), name, mono(28), INK, Qt.AlignmentFlag.AlignHCenter)
-        text(p, QRect(int(cx - slot / 2), ground + 62, slot, 50), cap, font(24, QFont.Weight.Medium), DUST, Qt.AlignmentFlag.AlignHCenter)
-        x += slot
-    p.fillRect(96, 1030, W - 192, 4, INK)
-    text(p, QRect(96, 1054, W - 192, 60), "放着不管的时候，它也在动", font(40), INK)
-    frames = [(pet(4, breath=True), "呼吸"), (pet(4, tilt=-1), "晃脑袋"), (pet(4, blink=True), "眨眼"), (pet(4, blink=True, breath=True), "睡着")]
-    gap2 = (W - 192 - sum(pm.width() for pm, _ in frames)) / 3
-    x, ground = 96.0, 1270
-    for pm, cap in frames:
-        cx = x + pm.width() / 2
-        feet(p, pm, cx, ground)
-        text(p, QRect(int(cx - 90), ground + 8, 180, 40), cap, font(26, QFont.Weight.Bold), DUST, Qt.AlignmentFlag.AlignHCenter)
-        if cap == "睡着":
-            label(p, "z", cx + 38, ground - 124, px=30)
-            label(p, "Z", cx + 58, ground - 152, px=38)
-        x += pm.width() + gap2
+    img, p = canvas()
+    sc = full_scene(540, 720, 2, seed=5)
+    sc.grow([("bottom", x / 10) for x in range(10)], 5200)
+    sc.render_mat(full=True)
+    upper = [(pet(0, size=3), 150), (pet(1), 400), (pet(2), 770)]
+    lower = [(pet(3), 270), (pet(4), 770)]
+    ground_up, ground_low = 900, H - 40
+    sc.patches = [F.Patch(int(x / 2), int(ground_up / 2) - 4, r, int(r) + 1, i * 31 + 5)
+                  for i, ((_, x), r) in enumerate(zip(upper, (5, 7.5, 9)))]
+    q = sc.begin()
+    q.end()
+    show(p, sc)
+    for pm, x in upper:
+        feet(p, big(pm, 3), x, ground_up)
+    for pm, x in lower:
+        feet(p, big(pm, 3), x, ground_low)
+    title_box(p, "从一个黑点\n开始", px=112)
     p.end()
     return img
 
 
 def feeding():
-    img, p = page("FUNGI.EXE — 喂食", "3 / 7")
-    headline(p, 140, "它吃的不是内容\n是混乱", "越乱越肥：命名混乱、重复、久放的最好吃", size=96)
-    sc = Scene(444, 236, seed=5)
-    sc.grow([("bottom", 0.4), ("left", 0.6), ("right", 0.3)], 700)
+    img, p = canvas()
+    sc = full_scene(270, 360, 4, seed=6)
+    sc.grow([("bottom", 0.2), ("bottom", 0.8), ("left", 0.3), ("right", 0.6)], 2600)
     sc.render_mat(full=True)
     q = sc.begin()
-    end = put_icon(q, FOLDER, 120, 58)
-    cur = icon(CURSOR)
-    q.drawImage(150, 100, cur)
-    ground = sc.h - 14
+    ground = sc.h - 12
     young = pet(3, mouth=True)
-    feet(q, young, 318, ground)
+    cx = 160
+    feet(q, young, cx, ground)
     rng = random.Random(4)
-    for _ in range(9):
-        x, y = 318 + rng.uniform(-34, 34), ground - young.height() + rng.uniform(-14, 14)
+    for _ in range(16):
+        a = rng.uniform(-2.8, -0.35)
+        d = rng.uniform(14, 52)
+        x, y = cx + math.cos(a) * d, ground - young.height() + 14 + math.sin(a) * d
         q.fillRect(int(x) - 3, int(y) - 3, 6, 6, PAPER)
         q.fillRect(int(x) - 2, int(y) - 2, 4, 4, INK)
-    arc(q, (150, 60), (300, ground - young.height() + 10), 40)
+    q.drawImage(34, 150, icon(FOLDER))
+    arc(q, (70, 150), (cx - 4, ground - young.height() - 4), 26, dots=9)
+    doc = icon(DOC)
+    q.drawImage(int(cx - 30), int(ground - young.height() - 44), doc.scaled(int(doc.width() * 0.6), int(doc.height() * 0.6)))
     q.end()
-    sc.blit(p, (W - sc.w * 2) // 2, 540)
-    icon_label(p, sc, "新建文件夹(3)", 120, end + 2)
-    fx, fy = sc.at(318, ground - young.height())
-    label(p, f"+19 未整理的、久放的", fx - 40, fy - 44, px=34)
-    rows = [("新建文件夹(3)/最终版_真的最终_v7/", "最肥", f"×{F.taste('新建文件夹(3)_最终版_真的最终_v7', 0)[0]:.1f}"),
-            ("整整齐齐的文件夹", "干巴巴", "×0.7"), ("资料归档/", "已归档（抖一下伞）", "×0.5"), ("网盘同步目录里的", "飘着，够不到", "不吃")]
-    y = 1052
-    for name, verdict, mult in rows:
-        p.fillRect(96, y, W - 192, 3, GREY)
-        text(p, QRect(96, y + 14, 500, 60), name, font(29, QFont.Weight.Bold), INK)
-        text(p, QRect(610, y + 14, 270, 60), verdict, font(29, QFont.Weight.Medium), DUST)
-        text(p, QRect(W - 96 - 140, y + 12, 140, 60), mult, mono(32), INK, Qt.AlignmentFlag.AlignRight)
-        y += 72
+    show(p, sc)
+    fx, fy = sc.at(cx, ground - young.height())
+    label(p, "+19", fx + 190, fy - 10, px=84)
+    title_box(p, "喂它文件", px=112)
     p.end()
     return img
 
 
-def colony_page():
-    img, p = page("FUNGI.EXE — 菌毯", "4 / 7")
-    headline(p, 140, "放着不管\n屏幕边上会长菌毯", "菌毯铺开以后，会冒出一只喷孢子的菌", size=92)
-    sc = Scene(444, 334, seed=9)
-    sc.grow([("bottom", 0.2), ("bottom", 0.62), ("right", 0.3), ("top", 0.5), ("left", 0.7), ("left", 0.2)], 4200)
+def overgrown():
+    img, p = canvas()
+    sc = full_scene(360, 480, 3, seed=77)
+    overgrow(sc, 40000, 24)
+    rng = random.Random(21)
+    spots = []
+    while len(spots) < 9:
+        x, y = rng.uniform(60, 300), rng.uniform(80, 420)
+        if all(math.hypot(x - a, y - b) > 62 for a, b in spots) and not (x < 210 and y < 130) and math.hypot(x - 180, y - 260) > 50:
+            spots.append((x, y))
+    sc.patches = [F.Patch(int(x), int(y), rng.uniform(3.5, 8.5), 9, rng.randrange(1 << 30)) for x, y in spots]
+    q = sc.begin()
+    feet(q, pet(0, size=3), 180, 270)
+    q.end()
+    show(p, sc)
+    title_box(p, "放着不管\n就长满了", px=112)
+    p.end()
+    return img
+
+
+def spitter_page():
+    img, p = canvas()
+    sc = full_scene(360, 480, 3, seed=14)
+    sc.grow([("bottom", x / 6) for x in range(6)] + [("left", 0.5), ("right", 0.5)], 6000)
     sc.render_mat(full=True)
-    sc.patches = [F.Patch(300, 120, 5.0, 6, 21)]
+    landings = [(70, 250, 5.5), (300, 200, 4.5), (180, 150, 0), (290, 330, 0), (60, 380, 3.5)]
+    sc.patches = [F.Patch(x, y, r, int(r) + 1, i * 97) for i, (x, y, r) in enumerate(landings) if r]
     q = sc.begin()
     sx, sy = draw_spitter(q, sc, 0.5, "shoot")
-    targets = [(300, 120, "patch"), (120, 140, "vanish"), (370, 230, "spore")]
-    for tx, ty, what in targets:
-        arc(q, (sx, sy), (tx, ty), 90)
-        if what == "spore":
-            feet(q, pet(0, size=3), tx, ty + 8)
-        elif what == "vanish":
-            for a in range(6):
-                ang = a * math.pi / 3 + 0.4
-                x, y = tx + math.cos(ang) * 10, ty + math.sin(ang) * 10
-                q.fillRect(int(x) - 3, int(y) - 3, 6, 6, QColor(250, 249, 244, 170))
-                q.fillRect(int(x) - 2, int(y) - 2, 4, 4, DUST)
+    for x, y, r in landings:
+        arc(q, (sx, sy), (x, y), 70, dots=14, size=4)
+        if not r:
+            feet(q, F.art_pixmap(0, 3), x, y + 6)
+    for k in (0.35, 0.6):
+        tx, ty = 300, 200
+        cx, cy = (sx + tx) / 2, min(sy, ty) - 70
+        x = (1 - k) ** 2 * sx + 2 * (1 - k) * k * cx + k * k * tx
+        y = (1 - k) ** 2 * sy + 2 * (1 - k) * k * cy + k * k * ty
+        feet(q, F.art_pixmap(0, 3), x, y)
     q.end()
-    sc.blit(p, (W - sc.w * 2) // 2, 560)
-    for tx, ty, s in ((120, 140, "75% 散掉"), (300, 120, "20% 落地成菌斑"), (370, 230, "5% 长成新孢子")):
-        px_, py_ = sc.at(tx, ty)
-        label(p, s, px_, py_ - 34, px=28)
-    text(p, QRect(96, 1262, W - 192, 110), "喷孢菌不会动，隔几分钟喷一次；\n菌毯鼠标点得穿，不挡你干活", font(32, QFont.Weight.Medium), INK)
+    show(p, sc)
+    title_box(p, "它会喷孢子", px=112)
     p.end()
     return img
-
-
-def measure(s: str, px: int, max_w: int) -> tuple[int, int]:
-    box = QFontMetrics(font(px, QFont.Weight.Bold)).boundingRect(QRect(0, 0, max_w, 2000), int(Qt.TextFlag.TextWrapAnywhere), s)
-    return box.width() + 44, box.height() + 40
 
 
 def chat_page():
-    img, p = page("FUNGI.EXE — 聊天", "5 / 7")
-    headline(p, 140, "双击它\n它只回你一句话", "接入 DeepSeek；说话方式是「文件菇·电波」", size=88)
-    lines = [("那个文件夹要不要整理一下", "那个文件夹已归档了，干巴巴的，我们不碰。", pet(2)),
-             ("你刚刚吃了什么", "（嗝）……「待办_旧_请勿删除」。", pet(2, mouth=True)),
-             ("今天好累", "还有一次备份我就满了，所以现在就说：你很好。", pet(2, blink=True)),
-             ("你是 AI 吧", "我知道你不是真的在问蘑菇。", pet(2))]
-    y = 530
-    for you, it, face in lines:
-        uw, uh = measure(you, 28, 520)
-        bubble(p, you, W - 96 - uw / 2, y + uh, px=28, max_w=520, dark=True, tail=False)
-        y += uh + 8
-        pm = face
-        bw, bh = measure(it, 30, W - 192 - pm.width() - 28 - 44)
-        row = max(pm.height(), bh)
-        feet(p, pm, 96 + pm.width() / 2, y + row - (row - pm.height()) / 2)
-        bubble(p, it, 96 + pm.width() + 28 + bw / 2, y + row - (row - bh) / 2, px=30, max_w=W - 192 - pm.width() - 28 - 44, tail=False)
-        y += row + 22
-    text(p, QRect(96, H - 36 - 62, 600, 40), "* 风格示例；回复限定一句话", font(24, QFont.Weight.Medium), DUST)
+    img, p = canvas()
+    sc = full_scene(360, 480, 3, seed=19)
+    sc.grow([("bottom", x / 5) for x in range(5)] + [("left", 0.7)], 3000)
+    sc.render_mat(full=True)
+    q = sc.begin()
+    ground = sc.h - 12
+    feet(q, pet(4), 180, ground)
+    q.end()
+    show(p, sc)
+    ax, ay = sc.at(180, ground - pet(4).height())
+    bubble(p, "我知道你不是真的\n在问蘑菇。", W / 2, ay + 30, px=76, max_w=960)
+    title_box(p, "双击\n它回你一句", px=112)
+    text(p, QRect(W - 260, H - 60, 220, 40), "* 风格示例", font(26, QFont.Weight.Medium), QColor(250, 249, 244, 150), Qt.AlignmentFlag.AlignRight)
     p.end()
     return img
 
 
 def hunger_page():
-    img, p = page("FUNGI.EXE — 饥饿", "6 / 7")
-    headline(p, 140, "不喂它会饿扁\n但不会死", "饿扁会缩回小时候，最后缩成孢囊；喂一口就活过来", size=92)
-    items = [(big(pet(3), 2), "吃饱", 1.0), (big(pet(3, mood="hungry"), 2), "饿了", 0.25),
-             (big(pet(3, wither=True, mood="starving"), 2), "饿扁了", 0.0), (big(pet(0, wither=True, mood="dormant"), 4), "休眠", 0.0)]
-    ground, xs = 860, [196, 425, 655, 885]
-    for (pm, cap, full), x in zip(items, xs):
-        feet(p, pm, x, ground)
-        text(p, QRect(x - 110, ground + 22, 220, 60), cap, font(40), INK, Qt.AlignmentFlag.AlignHCenter)
-        bw, bh, by = 170, 26, ground + 92
-        p.fillRect(x - bw // 2, by, bw, bh, INK)
-        p.fillRect(x - bw // 2 + 4, by + 4, bw - 8, bh - 8, PAPER)
-        p.fillRect(x - bw // 2 + 4, by + 4, int((bw - 8) * full), bh - 8, INK)
-    text(p, QRect(96, ground + 130, 300, 40), "↑ 饱腹", font(24, QFont.Weight.Medium), DUST)
-    label(p, "咕…", xs[1] + 60, ground - 230, px=36)
-    label(p, "喂一口就醒", xs[3], ground - 130, px=30)
-    text(p, QRect(96, 1110, W - 192, 150), "不喂的话 16 小时饿扁；所有菌都饿扁时，\n边上的菌毯会慢慢退回去，喷孢菌也蔫掉不喷", font(32, QFont.Weight.Medium), INK)
-    p.end()
-    return img
-
-
-def howto_page():
-    img, p = page("FUNGI.EXE — 玩法", "7 / 7")
-    headline(p, 140, "怎么养", "", size=100)
-    items = [("喂", "把 .txt / .md 或文件夹拖到它身上"),
-             ("聊", "双击它说话（自己填 DeepSeek Key）"),
-             ("看", "菌毯从屏幕边长出来，点击会穿过去"),
-             ("嗝", "吃完偶尔打嗝，嗝出前主人的一个文件名"),
-             ("⚠", "真的会吃掉：被吃的文件会删除（Windows 进回收站），路径记在 eaten.log；右键可关掉「吞噬文件」，网盘里的不碰")]
-    y = 320
-    for tag, desc in items:
-        p.fillRect(96, y, 76, 76, INK)
-        text(p, QRect(96, y + 8, 76, 60), tag, font(44), PAPER, Qt.AlignmentFlag.AlignHCenter)
-        f = font(36, QFont.Weight.Bold)
-        r = QRect(200, y + 10, W - 296, 240)
-        text(p, r, desc, f, INK)
-        hh = QFontMetrics(f).boundingRect(r, int(Qt.TextFlag.TextWordWrap), desc).height()
-        y += max(96, hh + 36)
-    y += 20
-    p.fillRect(96, y, W - 192, 4, INK)
-    text(p, QRect(96, y + 30, W - 192, 200), "开源 · Python + PyQt6\nLinux 实测，Windows 适配中\nGitHub：7SeaJim/spores", font(36, QFont.Weight.Medium), INK)
-    feet(p, big(pet(4, blink=True), 2), W - 250, H - 110)
+    img, p = canvas()
+    sc = full_scene(360, 480, 3, seed=44)
+    sc.grow([("bottom", 0.25), ("bottom", 0.75)], 500)
+    sc.render_mat(full=True)
+    q = sc.begin()
+    ground = sc.h - 12
+    for pm, x in ((pet(3, wither=True, mood="starving"), 60), (pet(0, wither=True, mood="dormant"), 126),
+                  (pet(4, wither=True, mood="starving"), 200), (pet(0, wither=True, mood="dormant"), 276),
+                  (pet(1, wither=True, mood="starving"), 326)):
+        feet(q, pm, x, ground)
+    q.end()
+    show(p, sc)
+    fx, fy = sc.at(200, ground - pet(4).height())
+    label(p, "咕……", fx, fy - 36, px=64)
+    title_box(p, "别忘了\n喂它", px=112)
     p.end()
     return img
 
 
 # ───────────── 效果动图 ─────────────
 
-def animation(path: Path, seconds: float = 10.0, fps: int = 10):
+def animation(path: Path, seconds: float = 12.0, fps: int = 10):
+    """延时摄影：一个小黑点 → 菌落 → 菌毯长满一整圈，喷孢菌喷出菌斑"""
     from PIL import Image
-    GW, GH, BAR = 640, 820, 60
-    sc = Scene(320, 380, seed=12)
-    sc.grow([("bottom", 0.5), ("left", 0.4), ("top", 0.7), ("right", 0.5)], 700)
+    GW, BAR = 640, 52
+    sc = Scene(320, 420, seed=12)
+    GH = BAR + sc.h * 2
+    sc.grow([("bottom", 0.5)], 6)
     sc.render_mat(full=True)
-    ground = sc.h - 14
-    home = (150, ground)
-    feeds = [  # (飞来的时刻, 名字, 图标, 起点, 吃完后的营养, 飘字)
-        (1.0, "aaa.txt", DOC, (64, 64), 15, "+13 久放的"),
-        (3.0, "新建文件夹(3)", FOLDER, (70, 150), 28, "+19 未整理的"),
-        (4.8, "", DOC, (64, 64), 60, "→ baby"),
-        (6.0, "", DOC, (70, 150), 110, "→ young"),
-        (7.2, "", FOLDER, (64, 64), 175, "→ adult"),
-    ]
+    ground = sc.h - 12
+    rng = random.Random(3)
+    founder = (160, [(0.0, 0), (1.6, 1), (2.6, 2), (3.4, 3), (4.2, 4)])
+    kids = [((52, ground), 5.0, [(5.6, 0), (7.6, 1), (9.6, 2)])]
+    feeds = [(0.6, DOC, (70, 110)), (1.2, FOLDER, (240, 140))]
+    shots = [(7.0, (110, 150)), (8.2, (220, 230)), (9.4, (80, 290)), (10.6, (190, 110))]
     frames = []
-    rng = random.Random(1)
+    def stage_at(t, plan):
+        return max([s for at, s in plan if t >= at] or [None])
     for n in range(int(seconds * fps)):
         t = n / fps
-        sc.mat.grow(20, rng=rng)
+        sc.mat.grow(int(8 + 90 * min(1.0, t / 7)), rng=rng)
+        for e in ("left", "right", "top"):
+            if t > 2.5 and rng.random() < 0.15:
+                sc.mat.seed(sc.mat.index_at(e, rng.randrange(sc.mat.edge_len(e))))
         sc.render_mat()
-        eaten = [f for f in feeds if t >= f[0] + 0.8]
-        nutrition = eaten[-1][4] if eaten else 0
-        stage = F.Creature(id="x", name="x", nutrition=nutrition).stage
-        last_eat = eaten[-1][0] + 0.8 if eaten else -9
-        eating = 0 <= t - last_eat < 0.8
-        flash = stage > 0 and 0.2 <= t - last_eat < 0.8 and eaten[-1][5].startswith("→") and int((t - last_eat) * 10) % 2 == 0
-        sc.patches = [F.Patch(236, 110, min(4.0, max(1.0, (t - 9.6) * 10)), 4, 9)] if t >= 9.6 else []
+        sc.patches = [F.Patch(x, y, min(6.0, max(1.0, (t - at - 0.5) * 6)), 6, i * 41 + 7)
+                      for i, (at, (x, y)) in enumerate(shots) if t >= at + 0.5]
         q = sc.begin()
-        for at, name, rows, start, _, _ in feeds:                     # 桌面上的文件：飞过去被吃掉
+        for at, rows, (x, y) in feeds:                                  # 文件飞进嘴里
             if t < at:
-                if name:
-                    put_icon(q, rows, *start)
-            elif t < at + 0.8:
-                k = (t - at) / 0.8
-                x = start[0] + (home[0] - start[0]) * k
-                y = start[1] + (home[1] - 60 - start[1]) * k - math.sin(math.pi * k) * 40
+                put_icon(q, rows, x, y)
+            elif t < at + 0.6:
+                k = (t - at) / 0.6
                 img = icon(rows)
-                q.drawImage(int(x - img.width() / 2 * (1 - k * 0.6)), int(y), img.scaled(int(img.width() * (1 - k * 0.6)), int(img.height() * (1 - k * 0.6))))
-        breath = int(t / 0.8) % 2 == 1 and not eating
-        blink = (t % 3.1) < 0.15
-        pm = F.art_pixmap(stage, F.spore_size(nutrition), blink, eating and stage > 0 and int(t * 8) % 2 == 0, flash, breath and stage > 0)
-        bob = -PX if eating and int(t * 8) % 2 else 0
-        feet(q, pm, home[0], home[1] + bob)
-        if eating:
-            k = t - last_eat
-            for i in range(7):
-                ang = -math.pi / 2 + (i - 3) * 0.45
-                x = home[0] + math.cos(ang) * 60 * k
-                y = home[1] - pm.height() + math.sin(ang) * 70 * k + 180 * k * k
-                q.fillRect(int(x) - 3, int(y) - 3, 6, 6, PAPER)
-                q.fillRect(int(x) - 2, int(y) - 2, 4, 4, INK)
-        if t >= 7.9:                                                   # 成年放孢子
-            for tx in (62, 262):
-                k = min(1.0, (t - 7.9) / 0.7)
-                x = home[0] + (tx - home[0]) * k
-                y = home[1] - 110 + (ground - home[1] + 110) * k - math.sin(math.pi * k) * 70
-                feet(q, F.art_pixmap(0, 3), x, y)
-        if t >= 8.6:                                                   # 喷孢菌从菌毯里冒出来
-            reveal = min(99, int((t - 8.6) / 0.6 * 22))
-            frame = "charge" if 9.1 <= t < 9.5 else "shoot" if 9.5 <= t < 9.8 else "idle"
+                s = 1 - 0.7 * k
+                px_ = x + (founder[0] - x) * k
+                py_ = y + (ground - 30 - y) * k - math.sin(math.pi * k) * 30
+                q.drawImage(int(px_ - img.width() * s / 2), int(py_), img.scaled(max(1, int(img.width() * s)), max(1, int(img.height() * s))))
+        st = stage_at(t, founder[1])
+        grew = max(at for at, s in founder[1] if t >= at)
+        flash = st > 0 and 0 <= t - grew < 0.5 and int((t - grew) * 10) % 2 == 0
+        chew = any(0 <= t - (at + 0.6) < 0.5 for at, _, _ in feeds)
+        breath = int(t / 0.8) % 2 == 1
+        blink = (t % 2.7) < 0.12
+        size = 3 if t < 1.2 else 5
+        feet(q, F.art_pixmap(st, size, blink, chew and st > 0, flash, breath and st > 0 and not chew), founder[0], ground - (PX if chew and int(t * 8) % 2 else 0))
+        for (x, y), born, plan in kids:                                  # 放出去的孢子落地后自己长大
+            if t < born:
+                continue
+            k = min(1.0, (t - born) / 0.6)
+            if k < 1:
+                sx, sy = founder[0], ground - 120
+                feet(q, F.art_pixmap(0, 3), sx + (x - sx) * k, sy + (y - sy) * k - math.sin(math.pi * k) * 60)
+            else:
+                ks = stage_at(t, plan)
+                feet(q, F.art_pixmap(ks, 3 + min(2, int((t - born) * 2)), (t % 3.3) < 0.12, False, False, ks > 0 and int(t / 0.9) % 2 == 0), x, y)
+        if t >= 6.0:                                                     # 喷孢菌冒出来，一次次喷
+            reveal = min(99, int((t - 6.0) / 0.6 * 22))
+            nxt = next((at for at, _ in shots if at + 0.25 > t), None)
+            frame = "shoot" if any(0 <= t - at < 0.25 for at, _ in shots) else "charge" if nxt and nxt - t < 0.5 else "idle"
             img = F.spitter_image(frame, 0, reveal)
-            bx, by = sc.spitter_base(0.18)
-            dx = (2 if int(t * 20) % 2 else -2) if frame == "charge" else 0
-            q.drawImage(int(bx - img.width() / 2 + dx), int(by - img.height() + PX), img)
-            if 9.5 <= t < 9.6 + 0.3:
-                k = min(1.0, (t - 9.5) / 0.4)
-                sx, sy = bx, by - img.height() + 12
-                cx, cy = (sx + 236) / 2, min(sy, 110) - 60
-                x = (1 - k) ** 2 * sx + 2 * (1 - k) * k * cx + k * k * 236
-                y = (1 - k) ** 2 * sy + 2 * (1 - k) * k * cy + k * k * 110
-                feet(q, F.art_pixmap(0, 3), x, y)
+            bx, by = sc.spitter_base(0.1)
+            q.drawImage(int(bx - img.width() / 2 + ((2 if int(t * 20) % 2 else -2) if frame == "charge" else 0)), int(by - img.height() + PX), img)
+            for at, (tx, ty) in shots:
+                if 0 <= t - at < 0.5:
+                    k = (t - at) / 0.5
+                    sx, sy = bx, by - img.height() + 12
+                    cx, cy = (sx + tx) / 2, min(sy, ty) - 70
+                    feet(q, F.art_pixmap(0, 3), (1 - k) ** 2 * sx + 2 * (1 - k) * k * cx + k * k * tx,
+                         (1 - k) ** 2 * sy + 2 * (1 - k) * k * cy + k * k * ty)
         q.end()
-
         img = QImage(GW, GH, QImage.Format.Format_ARGB32)
-        img.fill(PAPER)
         p = QPainter(img)
         p.fillRect(0, 0, GW, BAR, INK)
-        text(p, QRect(22, 12, 400, 40), "FUNGI.EXE", mono(28), PAPER)
-        sc.blit(p, 0, BAR)
-        p.fillRect(0, BAR, GW, 0, INK)
-        for at, name, rows, start, _, _ in feeds:
-            if name and t < at:
-                end = start[1] + icon(rows).height()
-                icon_label(p, sc, name, start[0], end + 2)
-        for at, _, _, _, _, words in feeds:
-            k = t - (at + 0.8)
-            if 0 <= k < 1.2:
-                fx, fy = sc.at(home[0], home[1] - pm.height())
-                F.draw_label(p, words, fx, fy - 14 - k * 30, font(30, QFont.Weight.Black), int(255 * min(1.0, (1.2 - k) * 2.5)))
-        if t >= 8.8:
-            ax, ay = sc.at(home[0], home[1] - pm.height())
-            bubble(p, "（嗝）……「aaa.txt」。", min(max(ax, 180), GW - 180), ay + 10, px=28, max_w=360)
+        text(p, QRect(20, 10, 400, 36), "FUNGI.EXE", mono(26), PAPER)
+        for i in range(3):
+            p.setPen(QPen(PAPER, 3))
+            p.drawRect(GW - 40 - i * 34, 14, 22, 22)
+        p.drawPixmap(0, BAR, big(sc.img, 2))
         p.end()
         rgba = img.convertToFormat(QImage.Format.Format_RGBA8888)
         pil = Image.frombuffer("RGBA", (GW, GH), bytes(rgba.constBits().asstring(rgba.sizeInBytes())), "raw", "RGBA", 0, 1)
         frames.append(pil.convert("RGB").quantize(colors=64, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE))
-    hold = [frames[-1]] * int(fps * 1.2)                              # 结尾停一下再循环
-    frames[0].save(path, save_all=True, append_images=frames[1:] + hold, duration=int(1000 / fps), loop=0, optimize=True, disposal=1)
-    print("saved", path, f"{path.stat().st_size / 1e6:.1f} MB", len(frames) + len(hold), "帧")
+    frames[0].save(path, save_all=True, append_images=frames[1:] + [frames[-1]] * int(fps * 1.5),
+                   duration=int(1000 / fps), loop=0, optimize=True, disposal=1)
+    print("saved", path, f"{path.stat().st_size / 1e6:.1f} MB", f"占满 {sc.mat.occupied():.0%}")
 
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    for n, fn in enumerate((cover, growth, feeding, colony_page, chat_page, hunger_page, howto_page), 1):
+    for n, fn in enumerate((cover, growth, feeding, overgrown, spitter_page, chat_page, hunger_page), 1):
         img = fn()
         path = OUT / f"{n:02d}_{fn.__name__}.png"
         img.save(str(path))
