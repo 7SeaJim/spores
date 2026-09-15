@@ -48,8 +48,10 @@ def shutdown(colony):
     for w in colony.widgets.values():
         w.timer.stop()
         w.close()
-    for v in colony.mat_views.values():
-        v.close()
+    colony.spitter_timer.stop()
+    for v in list(colony.mat_views.values()) + list(colony.patch_views.values()) + [colony.spitter_view] + colony.shots:
+        if v:
+            v.close()
 
 
 def drag(widget, paths, actions):
@@ -340,8 +342,13 @@ def screen_shot(colony, bg):
     shot = QImage(a.x() + a.width(), a.y() + a.height(), QImage.Format.Format_ARGB32)
     shot.fill(bg)
     sp = QPainter(shot)
+    for v in colony.patch_views.values():
+        sp.drawImage(v.geometry(), v.image)
     for v in colony.mat_views.values():
         sp.drawImage(v.geometry(), v.image)
+    for v in [colony.spitter_view] + [s for s in colony.shots if not s.done]:
+        if v:
+            sp.drawPixmap(v.pos(), v.grab())
     for w in colony.widgets.values():
         sp.drawPixmap(w.pos(), w.grab())
     sp.end()
@@ -355,6 +362,116 @@ check("隐藏菌毯：窗口关掉但继续长", not colony8.mat_views and colon
 colony8.set_mat_layer("bottom")
 check("只铺在桌面层", all(v.windowFlags() & Qt.WindowType.WindowStaysOnBottomHint for v in colony8.mat_views.values()))
 shutdown(colony8)
+
+print("11. 喷孢菌")
+colony9 = F.Colony(root / "spitter")
+m9 = colony9.mat
+a9 = colony9.mat_area()
+for i in range(int(m9.n * 0.2)):
+    m9.bump(i)
+colony9.check_spitter()
+check(f"边缘菌毯占比 < {F.SPITTER_AT:.0%} 时不长喷孢菌", colony9.spitter is None, f"{m9.occupied():.0%}")
+bottom0 = m9.cols + m9.rows
+for i in range(bottom0 - 40, bottom0 + m9.cols):
+    while m9.d[i % m9.n] < F.MAT_MAX:
+        m9.bump(i)
+colony9.check_spitter()
+sp = colony9.spitter
+check("占比够了就长出喷孢菌，扎根在够厚的菌毯上", sp is not None and m9.d[sp["i"]] >= F.MAT_SPROUT_DEPTH, f"{m9.occupied():.0%}")
+
+orient = []
+for edge in ("bottom", "top", "left", "right"):
+    i = m9.index_at(edge, m9.edge_len(edge) // 2)
+    for j in range(i - 3, i + 4):
+        while m9.d[j % m9.n] < F.MAT_MAX:
+            m9.bump(j)
+    colony9.plant_spitter(i, quiet=True)
+    v = colony9.spitter_view
+    bx, by = colony9.spitter_base()
+    g = v.geometry()
+    (ux, uy), _ = F.EDGE_POSE[edge]
+    cx, cy = g.center().x(), g.center().y()
+    inward = (cx - bx) * ux + (cy - by) * uy
+    edge_dist = {"bottom": a9.bottom() + 1 - by, "top": by - a9.top(), "left": bx - a9.left(), "right": a9.right() + 1 - bx}[edge]
+    tall = g.height() > g.width() if edge in ("top", "bottom") else g.width() > g.height()
+    orient.append((edge, inward > 20 and tall and abs(edge_dist - (m9.eff(i) - 2) * F.PX) < 1))
+    if edge == "bottom":
+        spitter_grab = (g, v.grab())
+check("四条边上都朝屏幕中心、根部埋进菌毯", all(ok for _, ok in orient), str(orient))
+
+rng = random.Random(7)
+counts = {k: 0 for k in F.OUTCOME_NAMES}
+for _ in range(20000):
+    counts[colony9.pick_outcome(rng)] += 1
+check("落地结果概率 ≈ 消失 50% / 菌毯 35% / 孢子 15%",
+      all(abs(counts[k] / 20000 - p) < 0.02 for k, p in F.SHOT_OUTCOMES), str(counts))
+
+colony9.plant_spitter(m9.index_at("bottom", m9.cols // 2), quiet=True)
+sp = colony9.spitter
+mid = (a9.center().x(), a9.center().y())
+n0, p0 = len(colony9.creatures), len(colony9.patches)
+shot = colony9.shoot("vanish", (mid[0] - 150, mid[1]))
+check("喷射时孢子弹鼠标穿透", bool(shot.windowFlags() & Qt.WindowType.WindowTransparentForInput))
+wait(0.3)
+flying_grab = (shot.geometry(), shot.grab())
+wait(2.4)
+check("消失：什么都不留下", len(colony9.creatures) == n0 and len(colony9.patches) == p0 and sp["stats"]["vanish"] == 1)
+colony9.shoot("mat", mid)
+wait(2.2)
+check("落在桌面中间形成菌斑", len(colony9.patches) == p0 + 1 and sp["stats"]["mat"] == 1)
+patch = colony9.patches[-1]
+r0 = patch.r
+colony9.shoot("mat", (mid[0] + 2, mid[1] + 2))
+wait(2.2)
+check("打中已有菌斑就让它长大，不新开一块", len(colony9.patches) == p0 + 1 and patch.r > r0)
+occ0 = sum(m9.d)
+colony9.shoot("mat", (a9.left() + 30, mid[1]))
+wait(2.2)
+check("落在边缘附近就加厚边缘菌毯", sum(m9.d) > occ0 and len(colony9.patches) == p0 + 1)
+colony9.shoot("spore", (mid[0] + 200, mid[1] + 120))
+wait(2.2)
+new = colony9.creatures[-1]
+check("变成独立小孢子（新的 spores）", len(colony9.creatures) == n0 + 1 and new.stage == 0
+      and math.dist((new.x, new.y), (mid[0] + 200, mid[1] + 120)) < 2 and sp["stats"]["spore"] == 1)
+while len(colony9.creatures) < F.MAX_COLONY:
+    colony9.creatures.append(colony9.new_creature(10, 10))
+pc = len(colony9.patches)
+colony9.shoot("spore", (mid[0] - 220, mid[1] - 150))
+wait(2.2)
+check("菌落满了，孢子改为形成菌斑", len(colony9.creatures) == F.MAX_COLONY and len(colony9.patches) == pc + 1)
+colony9.creatures = colony9.creatures[:n0 + 1]
+for _ in range(400):
+    colony9.grow_patches(F.PATCH_GROW)
+pv = colony9.patch_views[id(patch)]
+check("菌斑长到上限，窗口鼠标穿透", patch.r == patch.max and bool(pv.windowFlags() & Qt.WindowType.WindowTransparentForInput))
+check("菌斑有像素、没被窗口裁掉", any(pv.image.pixel(x, y) >> 24 for x in range(pv.image.width()) for y in range(pv.image.height()))
+      and not any(pv.image.pixel(x, 0) >> 24 or pv.image.pixel(0, x) >> 24 for x in range(pv.image.width())))
+shots0 = sp["shots"]
+sp["next_at"] = time.time() - 0.01
+colony9.spitter_tick()
+check("到时间自动喷，并排好下一次", sp["shots"] == shots0 + 1 and F.SPITTER_EVERY[0] - 1 <= sp["next_at"] - time.time() <= F.SPITTER_EVERY[1])
+sp["shot_at"] = 0
+sp["next_at"] = time.time() + 60
+colony9.poke_spitter()
+check("戳一下提前喷", sp["next_at"] - time.time() < 1)
+wait(2.2)
+colony9.save()
+snap_sp = (sp["edge"], round(sp["frac"], 4), sp["shots"], dict(sp["stats"]))
+snap_patches = [(p.x, p.y, round(p.r, 3), p.max, p.seed) for p in colony9.patches]
+for _ in range(6):
+    colony9.shoot(random.choice(["vanish", "mat"]))
+wait(0.5)
+screen9 = screen_shot(colony9, QColor(250, 249, 244))
+screen9_dark = screen_shot(colony9, QColor(38, 56, 74))
+shutdown(colony9)
+raw = json.loads((root / "spitter" / "save.json").read_text())
+raw["last_seen"] = time.time()
+(root / "spitter" / "save.json").write_text(json.dumps(raw))
+colony10 = F.Colony(root / "spitter")
+sp2 = colony10.spitter
+check("读档后喷孢菌和菌斑都在", sp2 and (sp2["edge"], round(sp2["frac"], 4), sp2["shots"], sp2["stats"]) == snap_sp
+      and [(p.x, p.y, round(p.r, 3), p.max, p.seed) for p in colony10.patches] == snap_patches)
+shutdown(colony10)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
@@ -377,6 +494,16 @@ img.save(str(out_dir / "widgets.png"))
 iimg.save(str(out_dir / "idle.png"))
 mat_light.save(str(out_dir / "mat_light.png"))
 mat_dark.save(str(out_dir / "mat_dark.png"))
+screen9.save(str(out_dir / "spitter_light.png"))
+screen9_dark.save(str(out_dir / "spitter_dark.png"))
+ori = QImage(4 * 140, 140, QImage.Format.Format_ARGB32)
+ori.fill(QColor(250, 249, 244))
+op = QPainter(ori)
+for n, (edge, rot) in enumerate((("bottom", 0), ("top", 180), ("left", 90), ("right", -90))):
+    img_o = F.spitter_image("idle", rot)
+    op.drawImage(n * 140 + (140 - img_o.width()) // 2, (140 - img_o.height()) // 2, img_o)
+op.end()
+ori.save(str(out_dir / "spitter_orient.png"))
 print(f"\n预览图: {out_dir / 'widgets.png'}")
 shutil.rmtree(root, ignore_errors=True)
 print("全部通过" if not failures else f"{failures} 项失败")

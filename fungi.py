@@ -31,7 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
-from PyQt6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics, QGuiApplication, QIcon,
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
@@ -86,6 +86,15 @@ MAT_RATE = 0.35            # 每次、每单位活力的生长步数
 MAT_FEED = 0.5             # 喂食时每 1 营养让最近那段菌毯多长几步
 MAT_OFFLINE_CAP = 20000    # 关闭期间最多补长多少步
 MAT_SPROUT_DEPTH = 6       # 菌毯厚到多少格才会冒小蘑菇
+
+# 喷孢菌：菌毯占到一定范围后长出来，不会动，定期往随机处喷孢子
+SPITTER_AT = 0.25          # 屏幕边缘一圈被菌毯占到多少长度时长出来
+SPITTER_EVERY = (60, 150)  # 喷射间隔（秒）
+SHOT_OUTCOMES = (("vanish", 0.50), ("mat", 0.35), ("spore", 0.15))   # 落地：消失 / 形成菌毯 / 变成独立小孢子
+PATCH_MAX = (3, 7)         # 桌面中间的菌斑最多长到多大半径（格），每块随机
+PATCH_GROW = 0.04          # 菌斑每次（MAT_TICK）长多少格半径
+MAX_PATCHES = 30
+OUTCOME_NAMES = {"vanish": "消失", "mat": "菌毯", "spore": "孢子"}
 
 EDIBLE_EXT = {".txt", ".md"}
 MAX_ITEMS_PER_DROP = 5
@@ -246,6 +255,18 @@ def spore_size(nutrition: float) -> int:
     return min(5, 3 + int(3 * nutrition / STAGES[1][1]))
 
 
+def paint_rows(rows: list[str], colors: dict[str, QColor]) -> QImage:
+    img = QImage(len(rows[0]) * PX, len(rows) * PX, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch in colors:
+                p.fillRect(x * PX, y * PX, PX, PX, colors[ch])
+    p.end()
+    return img
+
+
 @lru_cache(maxsize=512)
 def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = False,
                invert: bool = False, breath: bool = False, tilt: int = 0) -> QPixmap:
@@ -268,15 +289,7 @@ def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = Fal
     halo = QColor(INK if invert else PAPER)
     halo.setAlpha(235)
     colors[HALO] = halo
-    img = QImage(len(art[0]) * PX, len(art) * PX, QImage.Format.Format_ARGB32_Premultiplied)
-    img.fill(Qt.GlobalColor.transparent)
-    p = QPainter(img)
-    for y, row in enumerate(art):
-        for x, ch in enumerate(row):
-            if ch in colors:
-                p.fillRect(x * PX, y * PX, PX, PX, colors[ch])
-    p.end()
-    return QPixmap.fromImage(img)
+    return QPixmap.fromImage(paint_rows(art, colors))
 
 
 # ───────────────────────────── 数据 ─────────────────────────────
@@ -911,6 +924,10 @@ class Mycelium:
     def coverage(self) -> float:
         return sum(self.d) / (self.n * MAT_MAX)
 
+    def occupied(self) -> float:
+        """边缘一圈里有菌毯的长度占比"""
+        return len(self.active) / self.n
+
     # ── 绘制用 ──
     def eff(self, i: int) -> float:
         """画出来的厚度：平滑后叠加大小两层起伏，满厚的地方也有丘陵和洼地"""
@@ -1095,6 +1112,257 @@ class MatStrip(QWidget):
         p.end()
 
 
+# ───────────────────────────── 喷孢菌、孢子弹、菌斑 ─────────────────────────────
+
+EDGE_POSE = {"bottom": ((0, -1), 0), "top": ((0, 1), 180), "left": ((1, 0), 90), "right": ((-1, 0), -90)}   # 朝屏幕中心的方向、旋转角
+
+
+@lru_cache(maxsize=64)
+def spitter_image(frame: str, rotation: int = 0, reveal: int = 99) -> QImage:
+    """喷孢菌的一帧（idle / blink / charge / shoot），reveal = 从根部往上露出几行"""
+    drawn = load_pxl("spitter" if frame == "idle" else f"spitter_{frame}") or load_pxl("spitter")
+    if drawn:
+        rows, colors = list(drawn[0]), {ch: QColor(h) for ch, h in drawn[1]}
+    else:
+        rows, colors = ["..###..", ".#ooo#.", "#ooooo#", "#o#o#o#", "#ooooo#", ".#####."], {"#": INK, "o": PAPER}
+    if reveal < len(rows):
+        rows = ["." * len(rows[0])] * (len(rows) - reveal) + rows[len(rows) - reveal:]
+    halo = QColor(PAPER)
+    halo.setAlpha(235)
+    colors[HALO] = halo
+    img = paint_rows(add_halo(rows), colors)
+    return img.transformed(QTransform().rotate(rotation)) if rotation else img
+
+
+class SpitterWidget(QWidget):
+    """扎根在边缘菌毯上的喷孢菌：不会动，定期喷孢子"""
+    MARGIN = 8
+
+    def __init__(self, colony: "Colony", layer: str):
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.NoDropShadowWindowHint
+        flags |= Qt.WindowType.WindowStaysOnTopHint if layer == "top" else Qt.WindowType.WindowStaysOnBottomHint
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowTitle("fungi · spitter")
+        self.colony = colony
+        self.blinks = [time.time() + random.uniform(2, 5)]
+        self._key = None
+        self.place()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(50)
+
+    def pose(self, now: float) -> tuple[str, int, int, tuple[int, int]]:
+        sp, m = self.colony.spitter, self.colony.mat
+        edge = m.edge_of(sp["i"])[0]
+        (ux, uy), rot = EDGE_POSE[edge]
+        age = now - sp["born"]
+        reveal = int(22 * age / 2.5) if age < 2.5 else 99
+        shake = (0, 0)
+        if now - sp.get("shot_at", 0) < 0.35:
+            frame = "shoot"
+        elif sp["next_at"] - now < 0.8:
+            frame = "charge"
+            j = 2 if int(now * 20) % 2 else -2
+            shake = (abs(uy) * j, abs(ux) * j)          # 沿着边抖
+        elif any(b <= now < b + 0.15 for b in self.blinks):
+            frame = "blink"
+        else:
+            frame = "idle"
+        return frame, rot, reveal, shake
+
+    def place(self):
+        c, m, sp = self.colony, self.colony.mat, self.colony.spitter
+        (ux, uy), rot = EDGE_POSE[m.edge_of(sp["i"])[0]]
+        img = spitter_image("idle", rot)
+        r = spitter_image("idle").height() / 2 - PX          # 根部中心到图中心的距离
+        bx, by = c.spitter_base()
+        ix, iy = img.width() / 2 - ux * r, img.height() / 2 - uy * r
+        self.setGeometry(int(bx - ix) - self.MARGIN, int(by - iy) - self.MARGIN,
+                         img.width() + 2 * self.MARGIN, img.height() + 2 * self.MARGIN)
+
+    def tick(self):
+        now = time.time()
+        self.blinks = [b for b in self.blinks if now < b + 0.15] or [now + random.uniform(3, 8)]
+        key = self.pose(now)
+        if key != self._key:
+            self._key = key
+            self.update()
+
+    def paintEvent(self, _):
+        frame, rot, reveal, (dx, dy) = self.pose(time.time())
+        p = QPainter(self)
+        p.drawImage(self.MARGIN + dx, self.MARGIN + dy, spitter_image(frame, rot, reveal))
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.colony.poke_spitter()
+
+    def enterEvent(self, e):
+        self.setToolTip(self.colony.spitter_tip())
+
+    def contextMenuEvent(self, e):
+        self.colony.spitter_menu(e.globalPos())
+
+
+class SporeShot(QWidget):
+    """喷出去的孢子：沿抛物线飞到落点，落地后交给菌落处理"""
+    SIZE = 64
+
+    def __init__(self, colony: "Colony", start: tuple[float, float], end: tuple[float, float], outcome: str):
+        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput
+                 | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.NoDropShadowWindowHint)
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowTitle("fungi · spore")
+        self.colony, self.start, self.end, self.outcome = colony, start, end, outcome
+        dist = math.dist(start, end)
+        self.dur = min(1.8, max(0.6, 0.45 + dist / 1300))
+        self.lift = 50 + dist * 0.22
+        self.t0 = time.time()
+        self.landed_at: float | None = None
+        self.done = False
+        self.resize(self.SIZE, self.SIZE)
+        self.move_to(start)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(16)
+
+    def point(self, k: float) -> tuple[float, float]:
+        (ax, ay), (bx, by) = self.start, self.end
+        cx, cy = (ax + bx) / 2, min(ay, by) - self.lift
+        return ((1 - k) ** 2 * ax + 2 * (1 - k) * k * cx + k * k * bx,
+                (1 - k) ** 2 * ay + 2 * (1 - k) * k * cy + k * k * by)
+
+    def move_to(self, pt: tuple[float, float]):
+        self.move(int(pt[0] - self.SIZE / 2), int(pt[1] - self.SIZE / 2))
+
+    def finish(self):
+        self.done = True
+        self.timer.stop()
+        self.close()
+
+    def tick(self):
+        now = time.time()
+        if self.landed_at is None:
+            k = (now - self.t0) / self.dur
+            if k < 1:
+                self.move_to(self.point(k))
+            else:
+                self.landed_at = now
+                self.move_to(self.end)
+                self.colony.land_spore(self.outcome, *self.end)
+                if self.outcome != "vanish":
+                    self.finish()
+                    return
+        elif now - self.landed_at > 0.5:
+            self.finish()
+            return
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        c = self.SIZE / 2
+        if self.landed_at is None:
+            pm = art_pixmap(0, 3)
+            p.drawPixmap(int(c - pm.width() / 2), int(c - pm.height() / 2), pm)
+        else:                                            # 消失：散成一小团灰
+            k = min(1.0, (time.time() - self.landed_at) / 0.5)
+            paper, dust = QColor(PAPER), QColor(DUST)
+            paper.setAlpha(int(220 * (1 - k)))
+            dust.setAlpha(int(255 * (1 - k)))
+            for a in range(6):
+                ang = a * math.pi / 3 + 0.4
+                x, y = c + math.cos(ang) * (4 + 18 * k), c + math.sin(ang) * (4 + 18 * k)
+                p.fillRect(int(x) - 3, int(y) - 3, 6, 6, paper)
+                p.fillRect(int(x) - 2, int(y) - 2, 4, 4, dust)
+        p.end()
+
+
+@dataclass
+class Patch:
+    """桌面中间的一块菌斑（孢子落地形成）"""
+    x: int
+    y: int
+    r: float = 1.0
+    max: int = 5
+    seed: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Patch":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+PATCH_HALF = PATCH_MAX[1] + 8          # 菌斑窗口半宽（格）：最大半径 + 再被打中的余量 + 起伏 + 描边
+
+
+def patch_cell(p: Patch, u: int, v: int) -> int:
+    """菌斑中心偏移 (u, v) 格处的颜色（ARGB）"""
+    dist = math.hypot(u, v)
+    if dist > p.r * 1.3 + 3:
+        return 0
+    x = (math.atan2(v, u) + math.pi) / (2 * math.pi) * 7    # 一圈 7 段起伏，首尾相接
+    j = math.floor(x)
+    f = x - j
+    f = f * f * (3 - 2 * f)
+    wa, wb = _hash(j % 7, p.seed) / MAXH, _hash((j + 1) % 7, p.seed) / MAXH
+    R = max(0.6, p.r * (0.7 + 0.6 * (wa + (wb - wa) * f)))
+    s, sx = R - dist, p.seed % 997
+    if s > 0:
+        if s <= 0.4 + 1.2 * _vnoise2(u / 3 + sx, v / 3, 13):
+            return MAT_INK if _vnoise2(u / 2.3 + sx, v / 2.3, 17) > 0.66 else MAT_DUST
+        if _hash(u * 131 + v, p.seed + 101) % 37 == 0:
+            return MAT_PAPER
+        return MAT_DUST if _vnoise2(u / 3.1 + sx, v / 2.4, 41) > 0.7 else MAT_INK
+    if s > -1:
+        return MAT_HALO
+    if s > -2.5 and p.r >= 2 and _hash(u * 131 + v, p.seed + 55) % 9 == 0:
+        return MAT_DUST
+    return 0
+
+
+class PatchView(QWidget):
+    """一块菌斑的窗口：透明、鼠标穿透"""
+
+    def __init__(self, patch: Patch, layer: str):
+        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput
+                 | Qt.WindowType.NoDropShadowWindowHint)
+        flags |= Qt.WindowType.WindowStaysOnTopHint if layer == "top" else Qt.WindowType.WindowStaysOnBottomHint
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setWindowTitle("fungi · patch")
+        self.patch = patch
+        side = 2 * PATCH_HALF + 1
+        self.image = QImage(side, side, QImage.Format.Format_ARGB32)
+        self.setGeometry(int(patch.x - (PATCH_HALF + 0.5) * PX), int(patch.y - (PATCH_HALF + 0.5) * PX), side * PX, side * PX)
+        self.shown_r = None
+        self.render()
+
+    def render(self):
+        step = int(self.patch.r * 4)
+        if step == self.shown_r:
+            return
+        self.shown_r = step
+        self.image.fill(Qt.GlobalColor.transparent)
+        for u in range(-PATCH_HALF, PATCH_HALF + 1):
+            for v in range(-PATCH_HALF, PATCH_HALF + 1):
+                argb = patch_cell(self.patch, u, v)
+                if argb:
+                    self.image.setPixel(u + PATCH_HALF, v + PATCH_HALF, argb)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.drawImage(self.rect(), self.image)
+        p.end()
+
+
 # ───────────────────────────── 菌落（存档、生长、繁殖） ─────────────────────────────
 
 class Colony:
@@ -1114,6 +1382,11 @@ class Colony:
         self.mat_views: dict[str, MatStrip] = {}
         self.mat_acc = 0.0
         self.offline_elapsed = 0.0
+        self.spitter: dict | None = None
+        self.spitter_view: SpitterWidget | None = None
+        self.patches: list[Patch] = []
+        self.patch_views: dict[int, PatchView] = {}
+        self.shots: list[SporeShot] = []
 
         offline = self.load()
         self.grow_mat_offline(self.offline_elapsed)
@@ -1132,6 +1405,9 @@ class Colony:
         self.autosave = QTimer()
         self.autosave.timeout.connect(self.save)
         self.autosave.start(30_000)
+        self.spitter_timer = QTimer()
+        self.spitter_timer.timeout.connect(self.spitter_tick)
+        self.spitter_timer.start(100)
         self.tray = self.make_tray()
 
     def sleep_after(self) -> float:
@@ -1173,6 +1449,15 @@ class Colony:
             saved_mat = Mycelium.from_json(data.get("mat"))
             if saved_mat:
                 self.mat = saved_mat.resized(self.mat.cols, self.mat.rows)
+            self.patches = [Patch.from_dict(p) for p in data.get("patches", [])]
+            sp = data.get("spitter")
+            if sp and sp.get("edge") in EDGE_POSE:
+                length = self.mat.edge_len(sp["edge"])
+                pos = min(length - 1, max(0, int(sp.get("frac", 0.5) * length)))
+                self.spitter = {"i": self.mat.index_at(sp["edge"], pos), "edge": sp["edge"], "frac": sp.get("frac", 0.5),
+                                "born": sp.get("born", time.time()) - 99, "shots": sp.get("shots", 0),
+                                "stats": {k: sp.get("stats", {}).get(k, 0) for k in OUTCOME_NAMES},
+                                "next_at": time.time() + max(3.0, sp.get("next_in", 30) / self.passive_mult)}
             self.creatures = [Creature.from_dict(d) for d in data.get("creatures", [])]
             elapsed = time.time() - data.get("last_seen", time.time())
             self.offline_elapsed = max(0.0, elapsed)
@@ -1189,6 +1474,10 @@ class Colony:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top,
                 "mat_layer": self.mat_layer, "mat": self.mat.to_json(),
+                "patches": [asdict(p) for p in self.patches],
+                "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats")}
+                            | {"next_in": max(0.0, self.spitter["next_at"] - time.time()) * self.passive_mult})
+                if self.spitter else None,
                 "creatures": [asdict(c) for c in self.creatures]}
         tmp = self.save_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
@@ -1237,6 +1526,10 @@ class Colony:
                     w.puff(2)
         budget = MAT_RATE * vigor
         self.mat.grow(int(budget) + (random.random() < budget % 1))
+        self.grow_patches(PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        self.check_spitter()
+        if self.spitter_view:
+            self.spitter_view.place()
 
     def grow_mat_offline(self, elapsed: float):
         steps = elapsed * self.passive_mult / MAT_TICK
@@ -1247,11 +1540,15 @@ class Colony:
                 self.mat.seed(self.mat_index(c))
         vigor = sum(MAT_VIGOR[c.stage] for c in self.creatures)
         self.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * vigor)))
+        self.grow_patches(steps * PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        self.check_spitter(quiet=True)
 
     def build_mat_views(self):
-        for v in self.mat_views.values():
-            v.close()
-        self.mat_views = {}
+        old = list(self.mat_views.values()) + list(self.patch_views.values()) + [self.spitter_view]
+        for v in old:
+            if v:
+                v.close()
+        self.mat_views, self.patch_views, self.spitter_view = {}, {}, None
         if self.mat_layer != "hidden":
             a, m, t = self.mat_area(), self.mat, MAT_STRIP * PX
             w, h = m.cols * PX, m.rows * PX
@@ -1261,8 +1558,172 @@ class Colony:
             self.render_mat(full=True)
             for v in self.mat_views.values():
                 v.show()
+            for p in self.patches:
+                self.add_patch_view(p)
+            if self.spitter:
+                self.spitter_view = SpitterWidget(self, self.mat_layer)
+                self.spitter_view.show()
         for w in self.widgets.values():
             w.raise_()
+
+    # ── 菌斑 ──
+    def add_patch_view(self, p: Patch):
+        if self.mat_layer == "hidden":
+            return
+        v = PatchView(p, self.mat_layer)
+        self.patch_views[id(p)] = v
+        v.show()
+        for w in self.widgets.values():
+            w.raise_()
+
+    def grow_patches(self, amount: float):
+        for p in self.patches:
+            if p.r < p.max:
+                p.r = min(p.max, p.r + amount)
+                if id(p) in self.patch_views:
+                    self.patch_views[id(p)].render()
+
+    def mat_at(self, x: float, y: float):
+        """孢子在 (x, y) 落地形成菌毯：贴边就加厚边缘菌毯，打中已有菌斑就让它长大，否则长出新菌斑"""
+        a, m = self.mat_area(), self.mat
+        cx, cy = (x - a.x()) / PX, (y - a.y()) / PX
+        if min(cx, cy, m.cols - 1 - cx, m.rows - 1 - cy) < MAT_MAX + 4:
+            i = m.nearest(cx, cy)
+            m.seed(i)
+            m.grow(12, near=i)
+            self.render_mat()
+            return
+        hit = next((p for p in self.patches if math.hypot(p.x - x, p.y - y) < (p.r + 2) * PX), None)
+        if hit is None and len(self.patches) >= MAX_PATCHES:
+            hit = random.choice(self.patches)
+        if hit:
+            hit.max = min(PATCH_MAX[1] + 2, hit.max + 1)
+            hit.r = min(hit.max, hit.r + 1)
+            if id(hit) in self.patch_views:
+                self.patch_views[id(hit)].render()
+            return
+        p = Patch(int(x), int(y), 1.0, random.randint(*PATCH_MAX), random.randrange(1 << 30))
+        self.patches.append(p)
+        self.add_patch_view(p)
+
+    # ── 喷孢菌 ──
+    def shot_gap(self) -> float:
+        return random.uniform(*SPITTER_EVERY) / self.passive_mult
+
+    def check_spitter(self, quiet: bool = False):
+        m = self.mat
+        if self.spitter or m.occupied() < SPITTER_AT:
+            return
+        cands = [i for i in m.active if m.d[i] >= MAT_SPROUT_DEPTH
+                 and 12 <= m.edge_of(i)[1] < m.edge_len(m.edge_of(i)[0]) - 12]
+        if not cands:
+            return
+        cands.sort(key=lambda i: m.eff(i) + random.random() * 2, reverse=True)
+        self.plant_spitter(random.choice(cands[:20]), quiet)
+
+    def plant_spitter(self, i: int, quiet: bool = False):
+        m = self.mat
+        edge, pos = m.edge_of(i)
+        now = time.time()
+        self.spitter = {"i": i % m.n, "edge": edge, "frac": (pos + 0.5) / m.edge_len(edge), "born": now - (99 if quiet else 0),
+                        "shots": 0, "stats": {k: 0 for k in OUTCOME_NAMES}, "next_at": now + 3 + self.shot_gap()}
+        if self.mat_layer != "hidden":
+            if self.spitter_view:
+                self.spitter_view.close()
+            self.spitter_view = SpitterWidget(self, self.mat_layer)
+            self.spitter_view.show()
+            for w in self.widgets.values():
+                w.raise_()
+        self.save()
+
+    def spitter_base(self) -> tuple[float, float]:
+        """喷孢菌根部中心的屏幕坐标：埋进菌毯表面下 2 格"""
+        a, m, i = self.mat_area(), self.mat, self.spitter["i"]
+        edge, pos = m.edge_of(i)
+        w, h = m.cols * PX, m.rows * PX
+        u, v = (pos + 0.5) * PX, max(0.0, m.eff(i) - 2) * PX
+        return {"top": (a.x() + u, a.y() + v), "bottom": (a.x() + w - u, a.y() + h - v),
+                "right": (a.x() + w - v, a.y() + u), "left": (a.x() + v, a.y() + h - u)}[edge]
+
+    def pick_outcome(self, rng=random) -> str:
+        r, acc = rng.random(), 0.0
+        for name, p in SHOT_OUTCOMES:
+            acc += p
+            if r < acc:
+                return name
+        return SHOT_OUTCOMES[-1][0]
+
+    def shot_target(self, start: tuple[float, float]) -> tuple[float, float]:
+        a = self.mat_area()
+        pt = start
+        for _ in range(12):
+            pt = (random.uniform(a.left() + 40, a.right() - 40), random.uniform(a.top() + 40, a.bottom() - 40))
+            if math.dist(pt, start) > 240:
+                break
+        return pt
+
+    def spitter_tick(self):
+        self.shots = [s for s in self.shots if not s.done]
+        if self.spitter and time.time() >= self.spitter["next_at"]:
+            self.shoot()
+
+    def shoot(self, outcome: str | None = None, target: tuple[float, float] | None = None) -> SporeShot:
+        sp, now = self.spitter, time.time()
+        (ux, uy), _ = EDGE_POSE[self.mat.edge_of(sp["i"])[0]]
+        bx, by = self.spitter_base()
+        reach = spitter_image("idle").height() - 2 * PX
+        start = (bx + ux * reach, by + uy * reach)
+        shot = SporeShot(self, start, target or self.shot_target(start), outcome or self.pick_outcome())
+        shot.show()
+        self.shots.append(shot)
+        sp["shots"] += 1
+        sp["shot_at"], sp["next_at"] = now, now + self.shot_gap()
+        return shot
+
+    def land_spore(self, outcome: str, x: float, y: float):
+        if outcome == "spore" and len(self.creatures) >= MAX_COLONY:
+            outcome = "mat"
+        if self.spitter:
+            self.spitter["stats"][outcome] += 1
+        if outcome == "spore":
+            c = self.new_creature(int(x), int(y))
+            self.creatures.append(c)
+            w = self.spawn_widget(c)
+            w.play("land")
+            w.say("·")
+        elif outcome == "mat":
+            self.mat_at(x, y)
+        self.save()
+
+    def poke_spitter(self):
+        sp, now = self.spitter, time.time()
+        if sp and sp["next_at"] - now > 1.2 and now - sp.get("shot_at", 0) > 5:
+            sp["next_at"] = now + 0.8                    # 戳一下就提前喷
+
+    def spitter_tip(self) -> str:
+        sp = self.spitter
+        if not sp:
+            return ""
+        st = sp["stats"]
+        return (f"喷孢菌\n下一次 ~{max(0, int(sp['next_at'] - time.time()))}s\n"
+                f"喷了 {sp['shots']} 次：" + " · ".join(f"{OUTCOME_NAMES[k]} {st[k]}" for k in OUTCOME_NAMES))
+
+    def spitter_menu(self, pos: QPoint):
+        sp = self.spitter
+        if not sp:
+            return
+        m = QMenu()
+        m.setStyleSheet(MENU_QSS)
+        for line in (f"NAME   喷孢菌", f"AGE    {fmt_age(time.time() - sp['born'])}", f"SHOTS  {sp['shots']}",
+                     "  ".join(f"{OUTCOME_NAMES[k]} {sp['stats'][k]}" for k in OUTCOME_NAMES),
+                     f"NEXT   ~{max(0, int(sp['next_at'] - time.time()))}s"):
+            m.addAction(line).setEnabled(False)
+        m.addSeparator()
+        m.addAction("现在喷！", lambda: sp.__setitem__("next_at", time.time() + 0.8))
+        self.mat_menu(m)
+        m.addSeparator()
+        m.addAction("退出", QApplication.instance().quit)
+        m.exec(pos)
 
     def render_mat(self, full: bool = False):
         m = self.mat
@@ -1298,7 +1759,7 @@ class Colony:
             group.addAction(act)
 
         def refresh():
-            sub.setTitle(f"菌毯  {self.mat.coverage() * 100:.1f}%")
+            sub.setTitle(f"菌毯  {self.mat.coverage() * 100:.1f}%" + (f" · 菌斑 {len(self.patches)}" if self.patches else ""))
             for act, key in zip(group.actions(), ("top", "bottom", "hidden")):
                 act.setChecked(self.mat_layer == key)
         refresh()
@@ -1474,6 +1935,7 @@ class Colony:
         self.widgets.clear()
         self.creatures, self.name_i = [], 0
         self.mat = Mycelium(self.mat.cols, self.mat.rows)
+        self.spitter, self.patches = None, []
         self.build_mat_views()
         c = self.new_creature(*self.default_spot())
         self.creatures.append(c)
