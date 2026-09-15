@@ -304,6 +304,10 @@ def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = Fal
                invert: bool = False, breath: bool = False, tilt: int = 0, wither: bool = False,
                mood: str = "full") -> QPixmap:
     art, colors = None, {"#": INK, "o": PAPER}
+    if stage == 0 and mood == "dormant":                 # 休眠孢子：专门的孢囊帧（画稿缺失时退回灰方块）
+        drawn = load_pxl("dormant")
+        if drawn:
+            art, colors, wither = list(drawn[0]), {ch: QColor(hexc) for ch, hexc in drawn[1]}, False
     if stage > 0:
         name = STAGES[stage][0]
         frame = ("_eat" if mouth else "_starving" if mood == "starving" else "_blink" if blink
@@ -596,7 +600,7 @@ class CreatureWidget(QWidget):
 
     # ── 几何 ──
     def base_pixmap(self) -> QPixmap:
-        return art_pixmap(self.c.stage, spore_size(self.c.nutrition))
+        return art_pixmap(self.c.stage, spore_size(self.c.nutrition), mood="dormant" if self.c.mood == "dormant" else "full")
 
     def refit(self):
         pm = self.base_pixmap()
@@ -604,6 +608,7 @@ class CreatureWidget(QWidget):
         self.resize(w, h)
         self.sprite_rect = QRect((w - pm.width()) // 2, h - BOTTOM_PAD - pm.height(), pm.width(), pm.height())
         self.shown_stage = self.c.stage
+        self.shown_dormant = self.c.mood == "dormant"
         self.masked = None
         if not self.flight:
             self.place()
@@ -741,7 +746,7 @@ class CreatureWidget(QWidget):
         invert = anim == "grow" and int(t / 0.15) % 2 == 0
         wither = c.mood in ("starving", "dormant")
         if c.stage == 0:
-            return art_pixmap(0, spore_size(c.nutrition), invert=invert, wither=wither)
+            return art_pixmap(0, spore_size(c.nutrition), invert=invert, wither=wither, mood=c.mood)
         mouth = self.drag_over or (anim == "eat" and int(t * 8) % 2 == 0)
         blink = self.asleep or any(b <= now < b + 0.15 for b in self.blinks)
         calm = not (mouth or anim in LOUD_ANIMS or self.flight or self.press)
@@ -770,7 +775,7 @@ class CreatureWidget(QWidget):
             first = now + random.uniform(2.5, 7)
             self.blinks = [first, first + 0.3] if random.random() < 0.2 else [first]
         self.idle(now)
-        if self.c.stage != self.shown_stage:
+        if self.c.stage != self.shown_stage or (self.c.mood == "dormant") != self.shown_dormant:
             self.refit()
         mood = self.c.mood
         if mood != self.shown_mood:

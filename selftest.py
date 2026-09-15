@@ -593,10 +593,15 @@ w.idle_at, w.floaters, w.anim = 0, [], None
 w.last_touch = 0
 w.idle(time.time())
 check("休眠时一动不动、不睡觉冒 z", w.anim is None and not w.asleep and not w.floaters)
-check("休眠孢子是灰的", w.current_pixmap(time.time()).toImage() == F.art_pixmap(0, 3, wither=True).toImage())
+dormant_pm = F.art_pixmap(0, 3, mood="dormant")
+check("休眠孢子用专门的孢囊帧", F.load_pxl("dormant") and w.current_pixmap(time.time()).toImage() == dormant_pm.toImage()
+      and dormant_pm.toImage() != F.art_pixmap(0, 3, wither=True).toImage())
+check("进入休眠时窗口按孢囊尺寸对齐", w.sprite_rect.size() == dormant_pm.size())
 colony12.devour = False
 colony12.feed(w, [txt if txt.exists() else md])
 check("喂一次就活过来", c.mood == "full" and any("活过来了" in f["text"] for f in w.floaters), f"饱腹 {c.satiety:.0f}")
+w.tick()
+check("醒来后窗口换回孢子尺寸", w.sprite_rect.size() == F.art_pixmap(c.stage, F.spore_size(c.nutrition)).size())
 m12 = colony12.mat
 for i in range(60):
     for _ in range(4):
