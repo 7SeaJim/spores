@@ -63,11 +63,15 @@ MAX_ITEMS_PER_DROP = 5
 NAMES = ["puff", "kino", "shii", "enoki", "morel", "nameko", "maitake", "chanty",
          "porcini", "reishi", "shimeji", "inky", "bolete", "truffle", "oyster"]
 
+ART_DIR = Path(__file__).resolve().parent / "art"   # pixel4ai 画稿（.pxl），缺失时回退到程序生成
+
 INK = QColor(17, 17, 17)
 PAPER = QColor(250, 249, 244)
 
 # ───────────────────────────── 像素精灵 ─────────────────────────────
-# 字符: "#" 黑, "o" 白, "h" 描边(白), "." 透明
+# 优先读 art/<阶段>.pxl、<阶段>_blink.pxl、<阶段>_eat.pxl；没有画稿时用下面的程序生成
+# 程序生成的字符: "#" 黑, "o" 白, "." 透明
+HALO = "\x01"
 
 MUSHROOM_SHAPES = {        # 阶段: (菌盖宽, 菌盖高, 菌柄宽, 菌柄高)
     1: (11, 5, 7, 4),
@@ -163,6 +167,20 @@ def mushroom_art(stage: int, blink: bool = False, mouth: bool = False) -> list[s
     return ["".join(r) for r in g]
 
 
+@lru_cache(maxsize=64)
+def load_pxl(name: str) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]] | None:
+    """读 art/<name>.pxl（JSON: size / palette / rows）。没有或损坏时返回 None。"""
+    try:
+        data = json.loads((ART_DIR / f"{name}.pxl").read_text("utf-8"))
+        rows = tuple(data["rows"])
+        palette = tuple((ch, hexc) for ch, hexc in data["palette"].items() if hexc)
+        if not rows or any(len(r) != len(rows[0]) for r in rows):
+            return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return rows, palette
+
+
 def add_halo(art: list[str]) -> list[str]:
     h, w = len(art), len(art[0])
     out = [["."] * (w + 2) for _ in range(h + 2)]
@@ -177,7 +195,7 @@ def add_halo(art: list[str]) -> list[str]:
                 for dx in (-1, 0, 1):
                     yy, xx = y + dy - 1, x + dx - 1
                     if 0 <= yy < h and 0 <= xx < w and art[yy][xx] != ".":
-                        out[y][x] = "h"
+                        out[y][x] = HALO
     return ["".join(r) for r in out]
 
 
@@ -189,11 +207,20 @@ def spore_size(nutrition: float) -> int:
 @lru_cache(maxsize=128)
 def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = False,
                invert: bool = False) -> QPixmap:
-    art = add_halo(spore_art(size) if stage == 0 else mushroom_art(stage, blink, mouth))
-    ink, paper = (PAPER, INK) if invert else (INK, PAPER)
-    halo = QColor(paper)
+    art, colors = None, {"#": INK, "o": PAPER}
+    if stage > 0:
+        name = STAGES[stage][0]
+        drawn = load_pxl(name + ("_eat" if mouth else "_blink" if blink else "")) or load_pxl(name)
+        if drawn:
+            art, colors = list(drawn[0]), {ch: QColor(hexc) for ch, hexc in drawn[1]}
+    if art is None:
+        art = spore_art(size) if stage == 0 else mushroom_art(stage, blink, mouth)
+    art = add_halo(art)
+    if invert:
+        colors = {ch: QColor(255 - c.red(), 255 - c.green(), 255 - c.blue()) for ch, c in colors.items()}
+    halo = QColor(INK if invert else PAPER)
     halo.setAlpha(235)
-    colors = {"#": ink, "o": paper, "h": halo}
+    colors[HALO] = halo
     img = QImage(len(art[0]) * PX, len(art) * PX, QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(Qt.GlobalColor.transparent)
     p = QPainter(img)
