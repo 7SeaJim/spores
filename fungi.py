@@ -127,7 +127,14 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CHAT_BASE_URL = "https://api.deepseek.com"
 CHAT_MODELS = ("deepseek-flash", "deepseek-v4-pro")
 CHAT_MAX_CHARS = 40        # 一句话最多几个字，超出截断
-CHAT_HISTORY = 6           # 每只菌记住最近几轮对话（只在内存里）
+CHAT_HISTORY = 6           # 每次聊天带上最近几轮对话
+CHAT_MEMORY = 40           # 每只菌在 memory.json 里最多记多少条消息
+CHRONICLE_MAX = 200        # 菌落大事记最多记多少条（存进 save.json）
+CHRONICLE_IN_PROMPT = 20   # 聊天时带上最近几条大事记
+MAT_MILESTONES = (0.1, 0.25, 0.5, 0.75, 1.0)
+STAGE_CN = {"spores": "刚冒出来的 3×3 小黑孢子", "sprout": "刚长出菌盖的小芽", "baby": "圆滚滚的幼年小蘑菇",
+            "young": "长出了小手小脚的少年蘑菇", "adult": "会放孢子的成年蘑菇"}
+MOOD_CN = {"full": "吃得饱饱的", "hungry": "有点饿", "starving": "饿扁了、很虚弱", "dormant": "在休眠"}
 CHAT_TIMEOUT = 20          # 秒
 CHAT_ERRORS = {400: "请求格式不对", 401: "API Key 不对", 402: "DeepSeek 余额不足", 422: "参数不对，检查模型名",
                429: "说太快了，等等", 500: "DeepSeek 那边出错了", 503: "DeepSeek 太忙了"}
@@ -359,6 +366,7 @@ class Creature:
     feeds: int = 0
     released: int = 0                                   # 已放出的 spores 数
     satiety: float = 60.0                               # 饱腹 0–100
+    parent: str = ""                                    # 母体的 id；"spitter" = 喷孢菌喷出来的；"" = 菌落始祖
     x: int = 0                                          # 脚底中心的屏幕坐标
     y: int = 0
     eaten: list[str] = field(default_factory=list)      # 吃过的食物指纹（不保存路径）
@@ -1784,7 +1792,11 @@ class Colony:
         self.views_stale = False
         self.chat_path = data_dir / "chat.json"
         self.chat_cfg = self.load_chat_cfg()
-        self.chat_history: dict[str, list[dict]] = {}
+        self.memory_path = data_dir / "memory.json"
+        self.memory: dict[str, list[dict]] = self.load_memory()
+        self.chronicle: list[list] = []
+        self.moods: dict[str, str] = {}
+        self.mat_mark = 0.0
         self.chat_pending: set[str] = set()
         self.bubbles: dict[str, SpeechBubble] = {}
         self.chat_bridge = ChatBridge()
@@ -1877,6 +1889,11 @@ class Colony:
                                 "stats": {k: sp.get("stats", {}).get(k, 0) for k in OUTCOME_NAMES},
                                 "next_at": time.time() + max(3.0, sp.get("next_in", 30) / self.passive_mult)}
             self.creatures = [Creature.from_dict(d) for d in data.get("creatures", [])]
+            self.mat_mark = data.get("mat_mark", 0.0)
+            if "chronicle" in data:
+                self.chronicle = data["chronicle"][-CHRONICLE_MAX:]
+            else:                                          # 旧存档：推断亲缘，补上出生记录
+                self.infer_family()
             elapsed = time.time() - data.get("last_seen", time.time())
             self.offline_elapsed = max(0.0, elapsed)
             for c in self.creatures:
@@ -1886,12 +1903,15 @@ class Colony:
                     c.x, c.y = self.default_spot()
         if not self.creatures:
             self.creatures = [self.new_creature(*self.default_spot())]
+            self.log_event(f"{self.creatures[0].name} 在桌面上冒了出来")
+        self.moods = {c.id: c.mood for c in self.creatures}
         return offline
 
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top, "devour": self.devour,
-                "mat_layer": self.mat_layer, "mat": self.mat.to_json(),
+                "mat_layer": self.mat_layer, "mat": self.mat.to_json(), "mat_mark": self.mat_mark,
+                "chronicle": self.chronicle,
                 "patches": [asdict(p) for p in self.patches],
                 "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats")}
                             | {"next_in": max(0.0, self.spitter["next_at"] - time.time()) * self.passive_mult})
@@ -1918,6 +1938,7 @@ class Colony:
             self.metabolize(c, dt * self.passive_mult)
             if c.stage != before or c.spores_due() > 0:
                 self.after_growth(self.widgets[c.id], before)
+        self.track_moods()
         self.mat_acc += dt * self.passive_mult
         while self.mat_acc >= MAT_TICK:
             self.mat_acc -= MAT_TICK
@@ -2014,17 +2035,116 @@ class Colony:
         box.popup()
         return box
 
+    # ── 菌落大事记、亲缘、聊天记忆（聊天时动态拼进人设） ──
+    def log_event(self, text: str, when: float | None = None):
+        self.chronicle.append([int(when if when is not None else time.time()), text])
+        self.chronicle.sort(key=lambda e: e[0])
+        del self.chronicle[:-CHRONICLE_MAX]
+
+    def infer_family(self):
+        """旧存档没有母体和大事记：按代数和出生时间推断，并补上出生记录"""
+        by_born = sorted(self.creatures, key=lambda c: c.born)
+        founder = next((c for c in by_born if c.gen == 1), None)
+        kids: dict[str, int] = {}
+        for c in by_born:
+            if c.gen == 1:
+                c.parent = "" if c is founder else "spitter"
+            elif not c.parent:
+                cands = [p for p in by_born if p.gen == c.gen - 1 and p.born <= c.born and kids.get(p.id, 0) < p.released]
+                if cands:
+                    c.parent = cands[0].id
+                    kids[c.parent] = kids.get(c.parent, 0) + 1
+        names = {c.id: c.name for c in self.creatures}
+        for c in by_born:
+            if c is founder:
+                text = f"{c.name} 在桌面上冒了出来"
+            elif c.parent == "spitter":
+                text = f"喷孢菌喷出的孢子落地，长成了 {c.name}"
+            elif c.parent in names:
+                text = f"{names[c.parent]} 放出了孢子 {c.name}"
+            else:
+                text = f"{c.name} 出生了"
+            self.log_event(text, c.born)
+
+    def track_moods(self):
+        worse = {"hungry": "{} 饿了", "starving": "{} 饿扁了", "dormant": "{} 饿得缩成孢囊，进入了休眠"}
+        order = list(MOOD_NAMES)
+        for c in self.creatures:
+            old, new = self.moods.get(c.id, c.mood), c.mood
+            if new != old:
+                if order.index(new) > order.index(old):
+                    self.log_event(worse[new].format(c.name))
+                elif old in ("starving", "dormant"):
+                    self.log_event(f"{c.name} 被喂饱，活过来了")
+            self.moods[c.id] = new
+
+    def load_memory(self) -> dict[str, list[dict]]:
+        try:
+            data = json.loads(self.memory_path.read_text("utf-8"))
+            return {k: v for k, v in data.items() if isinstance(v, list)}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def save_memory(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.memory_path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(self.memory, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.memory_path)
+        os.chmod(self.memory_path, 0o600)
+
+    def relation(self, me: Creature, other: Creature) -> str:
+        if other.id == me.parent:
+            return "你的母体（你是它放出来的孢子）"
+        if other.parent == me.id:
+            return "你放出来的孩子"
+        if me.parent == "spitter" and other.parent == "spitter":
+            return "和你一样是喷孢菌喷出来的野孢子"
+        if me.parent and other.parent == me.parent:
+            return "和你同一个母体的兄弟姐妹"
+        if not other.parent and other.gen == 1:
+            return "菌落最早的始祖"
+        return "同一个菌落的伙伴"
+
+    @staticmethod
+    def where(me: Creature, other: Creature) -> str:
+        dx, dy = other.x - me.x, other.y - me.y
+        side = ("右边" if dx > 0 else "左边") if abs(dx) >= abs(dy) else ("下面" if dy > 0 else "上面")
+        dist = math.hypot(dx, dy)
+        return f"在你{side}{'很近的地方' if dist < 250 else '不远处' if dist < 700 else '很远的地方'}"
+
+    @staticmethod
+    def ago(ts: float) -> str:
+        sec = max(0, time.time() - ts)
+        return ("刚刚" if sec < 60 else f"{int(sec // 60)} 分钟前" if sec < 3600
+                else f"{int(sec // 3600)} 小时前" if sec < 86400 else f"{int(sec // 86400)} 天前")
+
     def persona(self, c: Creature) -> str:
-        stage = {"spores": "刚冒出来的 3×3 小黑孢子，还不太会说话", "sprout": "刚长出菌盖的小芽",
-                 "baby": "圆滚滚的幼年小蘑菇", "young": "长出了小手小脚的少年蘑菇", "adult": "成年蘑菇，会放孢子"}[c.stage_name]
-        mood = {"full": "吃得饱饱的", "hungry": "有点饿", "starving": "饿扁了，很虚弱", "dormant": "在休眠"}[c.mood]
-        extra = "屏幕边上还长着一只会喷孢子的喷孢菌。" if self.spitter else ""
-        return (f"你是电脑桌面上的一只黑白像素风真菌宠物，名叫 {c.name}，现在是{stage}，{mood}。"
-                f"你靠吃电脑里的 .txt 和 .md 文件长大，已经被喂过 {c.feeds} 次，出生 {fmt_age(time.time() - c.born)}。"
-                f"菌落里一共 {len(self.creatures)} 只菌，屏幕边缘的菌毯铺了 {self.mat.coverage() * 100:.0f}%。{extra}"
+        """聊天人设：固定规则在前（方便命中前缀缓存），再拼上此刻的自己、菌落成员、环境和最近发生的事"""
+        names = {o.id: o.name for o in self.creatures}
+        family = ("你是菌落最早的始祖" if not c.parent and c.gen == 1 else "你是喷孢菌喷出来的野孢子" if c.parent == "spitter"
+                  else f"你的母体是 {names[c.parent]}" if c.parent in names else "你的母体已经不在了")
+        others = [f"- {o.name}：{STAGE_CN[o.stage_name]}，{MOOD_CN[o.mood]}，第 {o.gen} 代，{self.relation(c, o)}，{self.where(c, o)}"
+                  for o in self.creatures if o is not c]
+        world = [f"屏幕边缘的菌毯铺了 {self.mat.coverage() * 100:.0f}%"]
+        if self.spitter:
+            st = self.spitter["stats"]
+            world.append(f"菌毯上长着一只不会动的喷孢菌，已经喷了 {self.spitter['shots']} 次孢子"
+                         f"（{st['vanish']} 次消失、{st['mat']} 次变成菌毯、{st['spore']} 次长成新孢子）")
+        if self.patches:
+            world.append(f"桌面中间有 {len(self.patches)} 块菌斑")
+        events = [f"- {self.ago(t)}：{text}" for t, text in self.chronicle[-CHRONICLE_IN_PROMPT:]]
+        return ("你是电脑桌面上的一只黑白像素风真菌宠物，靠吃电脑里的 .txt 和 .md 文件长大。"
                 "用中文回答，语气像一只好奇、有点呆的小蘑菇，符合你现在的状态。"
                 "只回复一句话，不超过 30 个字，不换行，不用表情符号，不要说自己是 AI。"
-                f"现在是 {time.strftime('%H:%M')}。")
+                "下面的资料就是你知道的全部：资料里的每一只菌你都认识；资料里没有的名字和事情就说不知道，不要编。\n\n"
+                f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，第 {c.gen} 代，"
+                f"出生 {fmt_age(time.time() - c.born)}，被喂过 {c.feeds} 次，{family}。\n"
+                f"【菌落成员】一共 {len(self.creatures)} 只：\n" + ("\n".join(others) if others else "- 只有你自己") + "\n"
+                "【环境】" + "；".join(world) + "。\n"
+                "【最近发生的事】\n" + ("\n".join(events) if events else "- 还没发生什么") + "\n"
+                f"现在是 {time.strftime('%m-%d %H:%M')}。")
 
     def send_chat(self, widget: CreatureWidget, text: str):
         c, text = widget.c, " ".join(text.split())[:200]
@@ -2034,8 +2154,8 @@ class Colony:
         if c.mood == "dormant":
             self.show_bubble(widget, "（休眠中……喂点东西才会醒）", error=True)
             return
-        history = self.chat_history.setdefault(c.id, [])
-        messages = [{"role": "system", "content": self.persona(c)}] + history[-2 * CHAT_HISTORY:] + [{"role": "user", "content": text}]
+        history = [{"role": m["role"], "content": m["content"]} for m in self.memory.get(c.id, [])[-2 * CHAT_HISTORY:]]
+        messages = [{"role": "system", "content": self.persona(c)}] + history + [{"role": "user", "content": text}]
         self.chat_pending.add(c.id)
         widget.thinking, widget.think_at = True, 0.0
         widget.update_mask()
@@ -2058,9 +2178,11 @@ class Colony:
         if err:
             self.show_bubble(w, f"（{err}）", error=True)
             return
-        history = self.chat_history.setdefault(cid, [])
-        history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
-        del history[:-2 * CHAT_HISTORY]
+        now = int(time.time())
+        history = self.memory.setdefault(cid, [])
+        history += [{"role": "user", "content": text, "t": now}, {"role": "assistant", "content": reply, "t": now}]
+        del history[:-CHAT_MEMORY]
+        self.save_memory()
         self.show_bubble(w, reply)
         if w.c.mood == "full":
             w.play("hop")
@@ -2126,6 +2248,11 @@ class Colony:
             self.grow_patches(PATCH_GROW * (0.5 + min(vigor, 6) / 6))
         else:
             self.mat.shrink(steps)                        # 全体饿扁：菌毯慢慢退
+        occupied = self.mat.occupied()
+        for mark in MAT_MILESTONES:
+            if occupied >= mark > self.mat_mark:
+                self.log_event("屏幕边缘都铺满了菌毯" if mark >= 1 else f"菌毯铺满了屏幕边缘的 {mark:.0%}")
+                self.mat_mark = mark
         self.check_spitter()
         if self.spitter_view:
             self.spitter_view.place()
@@ -2207,6 +2334,7 @@ class Colony:
             return
         p = Patch(int(x), int(y), 1.0, random.randint(*PATCH_MAX), random.randrange(1 << 30))
         self.patches.append(p)
+        self.log_event("喷孢菌的孢子在桌面中间长出了一块菌斑")
         self.add_patch_view(p)
 
     # ── 喷孢菌 ──
@@ -2230,6 +2358,7 @@ class Colony:
         now = time.time()
         self.spitter = {"i": i % m.n, "edge": edge, "frac": (pos + 0.5) / m.edge_len(edge), "born": now - (99 if quiet else 0),
                         "shots": 0, "stats": {k: 0 for k in OUTCOME_NAMES}, "next_at": now + 3 + self.shot_gap()}
+        self.log_event("屏幕边缘的菌毯上长出了一只喷孢菌")
         if self.mat_layer != "hidden":
             if self.spitter_view:
                 self.spitter_view.close()
@@ -2296,7 +2425,10 @@ class Colony:
         if outcome == "spore":
             c = self.new_creature(int(x), int(y))
             c.satiety = HUNGRY_AT                         # 野生孢子，一落地就有点饿
+            c.parent = "spitter"
             self.creatures.append(c)
+            self.moods[c.id] = c.mood
+            self.log_event(f"喷孢菌喷出的孢子落地，长成了 {c.name}")
             w = self.spawn_widget(c)
             w.play("land")
             w.say("·")
@@ -2412,6 +2544,9 @@ class Colony:
             self.render_mat()
         if len(paths) > MAX_ITEMS_PER_DROP:
             rejected.append("吃不下了")
+        if eaten:
+            self.log_event(f"{c.name} 被喂了 {len(eaten)} 份食物（+{sum(v for v, _ in eaten)} 营养）")
+            self.track_moods()
 
         if eaten:
             widget.play("eat")
@@ -2467,10 +2602,12 @@ class Colony:
         c = widget.c
         if c.stage < before:
             widget.refit()
+            self.log_event(f"{c.name} 饿得缩回了 {c.stage_name}")
             if not quiet:
                 widget.say(f"缩回 {c.stage_name}…")
         elif c.stage > before:
             widget.refit()
+            self.log_event(f"{c.name} 长成了 {c.stage_name}")
             if not quiet:
                 widget.play("grow")
                 widget.say(f"→ {c.stage_name}!", delay=0.9, big=True)
@@ -2486,7 +2623,10 @@ class Colony:
                 break
             tx, ty = self.find_spot(c)
             child = self.new_creature(tx, ty, gen=c.gen + 1)
+            child.parent = c.id
             self.creatures.append(child)
+            self.moods[child.id] = child.mood
+            self.log_event(f"{c.name} 放出了孢子 {child.name}")
             c.released += 1
             released += 1
             start = (c.x, c.y - widget.sprite_rect.height() + PX * 2)
@@ -2594,6 +2734,9 @@ class Colony:
             return
         self.creatures.remove(c)
         self.widgets.pop(c.id).close()
+        self.log_event(f"{c.name} 被放生，离开了桌面")
+        if self.memory.pop(c.id, None) is not None:
+            self.save_memory()
         self.save()
 
     def reset(self):
@@ -2606,9 +2749,12 @@ class Colony:
         self.creatures, self.name_i = [], 0
         self.mat = Mycelium(self.mat.cols, self.mat.rows)
         self.spitter, self.patches = None, []
+        self.chronicle, self.moods, self.mat_mark, self.memory = [], {}, 0.0, {}
+        self.save_memory()
         self.build_mat_views()
         c = self.new_creature(*self.default_spot())
         self.creatures.append(c)
+        self.log_event(f"{c.name} 在桌面上冒了出来")
         self.spawn_widget(c)
         self.save()
 

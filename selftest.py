@@ -810,6 +810,79 @@ os.environ.pop("DEEPSEEK_API_KEY")
 server.shutdown()
 shutdown(colony15)
 
+print("16. 聊天时知道菌落里的事（动态资料）")
+colony16 = F.Colony(root / "save16")
+colony16.devour = False
+mom = colony16.creatures[0]
+mw = colony16.widgets[mom.id]
+check("始祖出生写进大事记", colony16.chronicle and "冒了出来" in colony16.chronicle[-1][1])
+mom.nutrition, mom.satiety = F.STAGES[F.ADULT][1] + 1, 100
+colony16.after_growth(mw, 0)
+kids = [k for k in colony16.creatures if k is not mom]
+puff, kino = kids
+check("放出的孩子记着母体", all(k.parent == mom.id for k in kids))
+texts = [e[1] for e in colony16.chronicle]
+check("长大、放孢子写进大事记", any("长成了 adult" in x for x in texts) and f"{mom.name} 放出了孢子 {kino.name}" in texts)
+colony16.plant_spitter(colony16.mat.index_at("bottom", 50), quiet=True)
+colony16.land_spore("spore", 300, 300)
+wild = colony16.creatures[-1]
+check("喷孢菌喷出的孢子记为野孢子", wild.parent == "spitter" and colony16.chronicle[-1][1] == f"喷孢菌喷出的孢子落地，长成了 {wild.name}")
+p_mom, p_kino, p_wild = colony16.persona(mom), colony16.persona(kino), colony16.persona(wild)
+check(f"始祖 {mom.name} 认识 {kino.name}（你遇到的问题）", f"- {kino.name}：" in p_mom and "你放出来的孩子" in p_mom)
+check(f"{kino.name} 知道母体和兄弟姐妹 {puff.name}", f"你的母体是 {mom.name}" in p_kino and f"- {puff.name}：" in p_kino and "兄弟姐妹" in p_kino)
+check("野孢子知道自己从喷孢菌来，也认识大家", "你是喷孢菌喷出来的野孢子" in p_wild and f"- {mom.name}：" in p_wild)
+check("人设带环境、最近发生的事和相对时间", "喷孢菌" in p_kino and "【最近发生的事】" in p_kino and "刚刚" in p_kino)
+check("资料里没有的就说不知道", "不知道" in p_mom and p_mom.startswith("你是电脑桌面上的一只黑白像素风真菌宠物"))
+check("固定规则在最前面（前缀一致，方便缓存）", p_mom.split("【你自己】")[0] == p_kino.split("【你自己】")[0])
+kino.satiety, kino.nutrition = 0, 5
+colony16.track_moods()
+check("饿扁写进大事记", colony16.chronicle[-1][1] == f"{kino.name} 饿扁了")
+snack = root / "秘密菜谱.md"
+snack.write_text("面包" * 100)
+colony16.feed(colony16.widgets[kino.id], [snack])
+texts = [e[1] for e in colony16.chronicle]
+check("喂食写进大事记，但不含文件名", any(x.startswith(f"{kino.name} 被喂了 1 份食物") for x in texts) and not any("秘密菜谱" in x for x in texts))
+check("被喂活写进大事记", f"{kino.name} 被喂饱，活过来了" in texts)
+colony16.chat_pending.add(kino.id)
+colony16.on_chat_reply(kino.id, "你妈妈是谁", f"是 {mom.name} 呀！", "")
+mem_file = root / "save16" / "memory.json"
+check("聊天记忆写进 memory.json（仅本人可读）", stat.S_IMODE(os.stat(mem_file).st_mode) == 0o600
+      and json.loads(mem_file.read_text())[kino.id][-1]["content"] == f"是 {mom.name} 呀！")
+n_events = len(colony16.chronicle)
+family = {k.name: k.parent for k in colony16.creatures}
+colony16.save()
+shutdown(colony16)
+colony17 = F.Colony(root / "save16")
+check("重启后大事记、母体都还在", len(colony17.chronicle) >= n_events and {k.name: k.parent for k in colony17.creatures} == family)
+kino2 = next(k for k in colony17.creatures if k.name == kino.name)
+captured = []
+real_request = F.chat_request
+F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or "嗯。"
+colony17.chat_cfg = {"api_key": "x"}
+colony17.send_chat(colony17.widgets[kino2.id], "还记得我问过什么吗")
+wait(0.6)
+F.chat_request = real_request
+check("重启后聊天仍带着之前的对话", captured and [m["content"] for m in captured[0][1:3]] == ["你妈妈是谁", f"是 {mom.name} 呀！"]
+      and all("t" not in m for m in captured[0]))
+real_q = F.QMessageBox.question
+F.QMessageBox.question = lambda *a, **k: F.QMessageBox.StandardButton.Yes
+colony17.release(colony17.widgets[kino2.id])
+F.QMessageBox.question = real_q
+check("放生：删掉它的记忆，写进大事记", kino2.id not in json.loads(mem_file.read_text()) and colony17.chronicle[-1][1] == f"{kino.name} 被放生，离开了桌面")
+colony17.save()
+shutdown(colony17)
+raw = json.loads((root / "save16" / "save.json").read_text())
+raw.pop("chronicle")
+for d in raw["creatures"]:
+    d.pop("parent")
+(root / "save16" / "save.json").write_text(json.dumps(raw))
+colony18 = F.Colony(root / "save16")
+inferred = {k.name: k.parent for k in colony18.creatures}
+ids = {k.name: k.id for k in colony18.creatures}
+check("旧存档：推断出始祖、孩子、野孢子", inferred[mom.name] == "" and inferred[puff.name] == ids[mom.name] and inferred[wild.name] == "spitter")
+check("旧存档：补写出生记录", f"{mom.name} 放出了孢子 {puff.name}" in [e[1] for e in colony18.chronicle])
+shutdown(colony18)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
