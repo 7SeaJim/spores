@@ -169,6 +169,100 @@ colony4 = F.Colony(data)
 check("损坏存档被备份并重新开始", len(colony4.creatures) == 1 and list(data.glob("save.broken-*.json")))
 shutdown(colony4)
 
+print("9. 待机动效")
+from PyQt6.QtGui import QEnterEvent
+for st in range(1, 5):
+    rows = F.load_pxl(F.STAGES[st][0])[0]
+    cap, br = F.IDLE_RIG[st]
+    width = lambda r: len(r.strip("."))
+    check(f"{F.STAGES[st][0]} 骨骼：第 {cap} 行起是菌柄、呼吸行 {br} 在菌柄里",
+          width(rows[cap]) < width(rows[cap - 1]) and cap < br < len(rows) - 1)
+base = F.art_pixmap(4)
+poses = [F.art_pixmap(4, 3, False, False, False, b, tl) for b in (False, True) for tl in (-1, 0, 1)]
+check("呼吸/歪头不改变精灵尺寸（窗口不抖）", all(p.size() == base.size() for p in poses))
+check("呼吸帧、左歪、右歪都和静止帧不同",
+      all(F.art_pixmap(4, 3, False, False, False, b, tl).toImage() != base.toImage() for b, tl in ((True, 0), (False, -1), (False, 1))))
+
+colony5 = F.Colony(root / "idle")
+a = colony5.creatures[0]
+a.released = F.FIRST_BURST
+a.nutrition = F.STAGES[F.ADULT][1] + 1
+aw = colony5.widgets[a.id]
+aw.refit()
+now = time.time()
+P = F.BREATH_PERIOD
+aw.blinks = [now + 100]
+aw.idle_at = now + 100
+aw.phase = (0.1 - now) % P             # 此刻吸气（不压缩），避开周期边界的浮点误差
+aw.anim = ("tilt", now - 0.1)
+check("歪头动画第一拍是向左歪 1 格", aw.current_pixmap(now).toImage() == F.art_pixmap(4, 3, False, False, False, False, -1).toImage())
+aw.anim = None
+aw.phase = (-now + 0.8 * P) % P        # 此刻呼气
+check("呼气时菌柄压缩 1 行", aw.current_pixmap(now).toImage() == F.art_pixmap(4, 3, False, False, False, True, 0).toImage())
+aw.drag_over = True
+check("张嘴时不叠加呼吸", aw.current_pixmap(now).toImage() == F.art_pixmap(4, 3, False, True, False, False, 0).toImage())
+aw.drag_over = False
+breath_grab = aw.grab()
+
+aw.do_idle("blink2")
+check("连眨两下", len(aw.blinks) == 2)
+aw.do_idle("puff")
+aw.update_mask()
+check("成年菌飘孢子尘，窗口只放开上方窄带", sum(q["kind"] == "mote" for q in aw.particles) == 3 and aw.masked == "band")
+wait(1.0)
+puff_grab = aw.grab()
+aw.particles = []
+aw.anim = ("wiggle", time.time())
+check("spores 扭一扭是左右位移", aw.body_offset(time.time())[0] != 0)
+aw.anim = None
+aw.idle_at = 0
+aw.idle(time.time())
+check("到点会自己做一个小动作", aw.anim is not None or aw.particles or len(aw.blinks) == 2)
+
+aw.anim, aw.particles, aw.floaters = None, [], []
+check("睡眠阈值：白天 600s / 深夜 120s", colony5.sleep_after() in (120, 600))
+aw.last_touch = time.time() - 10_000
+aw.idle(time.time())
+check("很久没人理就睡着", aw.asleep)
+aw.z_at = 0
+aw.idle(time.time())
+aw.update_mask()
+check("睡着冒 z，但不整窗挡点击", any(f["ambient"] for f in aw.floaters) and aw.masked == "band")
+now = time.time()
+aw.phase = (0.1 - now) % (P * 1.6)     # 睡着时呼吸周期 ×1.6，此刻吸气
+check("睡着时闭眼", aw.current_pixmap(now).toImage() == F.art_pixmap(4, 3, True, False, False, False, 0).toImage())
+for f in aw.floaters:
+    f["t0"] = time.time() - 0.6
+sleep_grab = aw.grab()
+QApplication.sendEvent(aw, QEnterEvent(QPointF(20, 20), QPointF(20, 20), QPointF(20, 20)))
+check("鼠标碰到就醒，跳一下冒 !", not aw.asleep and aw.anim and aw.anim[0] == "hop" and any(f["text"] == "!" for f in aw.floaters))
+shutdown(colony5)
+
+strip = []
+for st in range(1, 5):
+    strip += [F.art_pixmap(st), F.art_pixmap(st, 3, False, False, False, True, 0),
+              F.art_pixmap(st, 3, False, False, False, False, -1), F.art_pixmap(st, 3, False, False, False, False, 1),
+              F.art_pixmap(st, 3, True, False, False, True, 0)]
+iw = max(sum(p.width() + 16 for p in strip[i:i + 5]) for i in range(0, 20, 5)) + 16
+grabs = [breath_grab, puff_grab, sleep_grab]
+ih = sum(max(p.height() for p in strip[i:i + 5]) + 16 for i in range(0, 20, 5)) + max(g.height() for g in grabs) + 32
+iimg = QImage(max(iw, sum(g.width() + 16 for g in grabs) + 16), ih, QImage.Format.Format_ARGB32)
+iimg.fill(QColor(250, 249, 244))
+ip = QPainter(iimg)
+y = 16
+for i in range(0, 20, 5):
+    x, h = 16, max(p.height() for p in strip[i:i + 5])
+    for pm in strip[i:i + 5]:
+        ip.drawPixmap(x, y + h - pm.height(), pm)
+        x += pm.width() + 16
+    y += h + 16
+ip.fillRect(0, y, iimg.width(), iimg.height() - y, QColor(38, 56, 74))
+x = 16
+for g in grabs:
+    ip.drawPixmap(x, y + 8, g)
+    x += g.width() + 16
+ip.end()
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
@@ -187,6 +281,7 @@ for y0 in (10, H // 2 + 10):
 p.end()
 out_dir.mkdir(parents=True, exist_ok=True)
 img.save(str(out_dir / "widgets.png"))
+iimg.save(str(out_dir / "idle.png"))
 print(f"\n预览图: {out_dir / 'widgets.png'}")
 shutil.rmtree(root, ignore_errors=True)
 print("全部通过" if not failures else f"{failures} 项失败")

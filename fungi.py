@@ -57,6 +57,24 @@ MAX_COLONY = 12
 PASSIVE_SECONDS = 120      # 每隔多少秒自然 +1 营养
 OFFLINE_CAP = 24           # 关闭程序期间最多补多少营养
 
+# 待机动效
+IDLE_RIG = {               # 阶段: (菌盖行数, 呼吸时抽掉的菌柄行) —— 对应 art/<阶段>.pxl 的行号
+    1: (7, 8),
+    2: (10, 14),
+    3: (14, 20),
+    4: (19, 27),
+}
+BREATH_PERIOD = 3.2        # 呼吸周期（秒），睡着时 ×1.6
+IDLE_GAP = (6, 16)         # 两个待机小动作之间隔几秒
+SLEEP_AFTER = 600          # 多少秒没人理就睡着；深夜 0–7 点缩短到 1/5
+IDLE_WEIGHTS = {           # 阶段: [(动作, 权重)]
+    0: [("wiggle", 3), ("hop", 1)],
+    1: [("tilt", 2), ("hop", 2), ("blink2", 2)],
+    2: [("tilt", 3), ("hop", 2), ("blink2", 2)],
+    3: [("tilt", 3), ("hop", 1), ("blink2", 2)],
+    4: [("tilt", 3), ("hop", 1), ("blink2", 2), ("puff", 3)],
+}
+
 EDIBLE_EXT = {".txt", ".md"}
 MAX_ITEMS_PER_DROP = 5
 
@@ -199,22 +217,39 @@ def add_halo(art: list[str]) -> list[str]:
     return ["".join(r) for r in out]
 
 
+def pose(art: list[str], cap_rows: int, breath_row: int, breath: bool, tilt: int) -> list[str]:
+    """待机姿势。左右各留 1 列给歪头；呼吸时抽掉一行菌柄、顶部补一行，脚底不动、菌盖和脸下沉 1 格。"""
+    rows = ["." + r + "." for r in art]
+    if tilt:
+        for i in range(min(cap_rows, len(rows))):
+            rows[i] = "." + rows[i][:-1] if tilt > 0 else rows[i][1:] + "."
+    if breath and 0 <= breath_row < len(rows):
+        del rows[breath_row]
+        rows.insert(0, "." * len(rows[0]))
+    return rows
+
+
 def spore_size(nutrition: float) -> int:
     """spores 阶段内部：3×3 → 4×4 → 5×5，方块慢慢变大"""
     return min(5, 3 + int(3 * nutrition / STAGES[1][1]))
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=512)
 def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = False,
-               invert: bool = False) -> QPixmap:
+               invert: bool = False, breath: bool = False, tilt: int = 0) -> QPixmap:
     art, colors = None, {"#": INK, "o": PAPER}
     if stage > 0:
         name = STAGES[stage][0]
         drawn = load_pxl(name + ("_eat" if mouth else "_blink" if blink else "")) or load_pxl(name)
         if drawn:
             art, colors = list(drawn[0]), {ch: QColor(hexc) for ch, hexc in drawn[1]}
+            rig = IDLE_RIG[stage]
     if art is None:
         art = spore_art(size) if stage == 0 else mushroom_art(stage, blink, mouth)
+        if stage > 0:
+            rig = (MUSHROOM_SHAPES[stage][1], len(art) - 2)
+    if stage > 0:
+        art = pose(art, rig[0], rig[1], breath, tilt)
     art = add_halo(art)
     if invert:
         colors = {ch: QColor(255 - c.red(), 255 - c.green(), 255 - c.blue()) for ch, c in colors.items()}
@@ -368,7 +403,11 @@ QMenu::indicator {{ width:10px; height:10px; border:2px solid {INK.name()}; marg
 QMenu::indicator:checked {{ background:{INK.name()}; }}
 """
 
-ANIM_DUR = {"eat": 0.8, "shake": 0.5, "poke": 0.4, "grow": 1.2, "land": 0.3, "hop": 0.35}
+ANIM_DUR = {"eat": 0.8, "shake": 0.5, "poke": 0.4, "grow": 1.2, "land": 0.3, "hop": 0.35,
+            "tilt": 1.5, "wiggle": 0.5}
+LOUD_ANIMS = {"eat", "shake", "poke", "grow"}    # 会跳出精灵附近的动画，需要整窗绘制
+TILT_STEPS = (-1, -1, 0, 1, 1, 0)
+DUST = QColor(85, 82, 76)
 
 
 # ───────────────────────────── 单只菌的窗口 ─────────────────────────────
@@ -393,10 +432,16 @@ class CreatureWidget(QWidget):
         self.hover = self.drag_over = False
         self.press: tuple[QPoint, int, int] | None = None
         self.moved = False
-        self.masked: bool | None = None
+        self.masked: str | None = None
         self.shown_stage = creature.stage
-        self.blink_at = time.time() + random.uniform(2, 6)
-        self.hop_at = time.time() + random.uniform(10, 30)
+        now = time.time()
+        self.blinks = [now + random.uniform(2, 6)]
+        self.idle_at = now + random.uniform(*IDLE_GAP)
+        self.phase = random.uniform(0, BREATH_PERIOD)   # 错开每只菌的呼吸
+        self.last_touch = now
+        self.asleep = False
+        self.z_at = 0.0
+        self.z_n = 0
         self._key = None
         self.sprite_rect = QRect()
 
@@ -427,35 +472,95 @@ class CreatureWidget(QWidget):
         self.move(int(x - self.width() / 2), int(y - (self.height() - BOTTOM_PAD) + PX))
 
     def update_mask(self):
+        """tight: 只有精灵附近；band: 再加精灵正上方一条（z、孢子尘）；full: 整窗（飘字、跳跃、悬停）"""
         if not USE_INPUT_MASK:
             return
-        want = not (self.hover or self.floaters or self.particles or self.anim or self.flight)
-        if want == self.masked:
+        loud = (self.hover or self.flight or (self.anim and self.anim[0] in LOUD_ANIMS)
+                or any(not f["ambient"] for f in self.floaters)
+                or any(q["kind"] == "crumb" for q in self.particles))
+        mode = "full" if loud else "band" if (self.asleep or self.floaters or self.particles) else "tight"
+        if mode == self.masked:
             return
-        self.masked = want
-        if want:
-            self.setMask(QRegion(self.sprite_rect.adjusted(-14, -14, 14, BOTTOM_PAD)))
-        else:
+        self.masked = mode
+        if mode == "full":
             self.clearMask()
+            return
+        r = self.sprite_rect
+        region = QRegion(r.adjusted(-14, -14, 14, BOTTOM_PAD))
+        if mode == "band":
+            region = region.united(QRegion(QRect(r.x() - 14, 0, r.width() + 28, r.y())))
+        self.setMask(region)
 
     # ── 动画 ──
     def play(self, name: str):
         self.anim = (name, time.time())
         self.update_mask()
 
-    def say(self, text: str, delay: float = 0.0, big: bool = False):
+    def say(self, text: str, delay: float = 0.0, big: bool = False, ambient: bool = False):
         t0 = time.time() + delay
-        if self.floaters:
-            t0 = max(t0, self.floaters[-1]["t0"] + 0.45)
-        self.floaters.append({"text": text, "t0": t0, "dur": 1.6, "big": big})
+        queue = [f for f in self.floaters if not f["ambient"]]
+        if queue and not ambient:
+            t0 = max(t0, queue[-1]["t0"] + 0.45)
+        self.floaters.append({"text": text, "t0": t0, "dur": 2.2 if ambient else 1.6, "big": big, "ambient": ambient})
         self.update_mask()
 
     def crumbs(self, n: int = 7):
         now = time.time()
         r = self.sprite_rect
         for _ in range(n):
-            self.particles.append({"x": r.center().x(), "y": r.y() + PX * 2, "vx": random.uniform(-70, 70),
-                                   "vy": random.uniform(-150, -60), "t0": now})
+            self.particles.append({"kind": "crumb", "x": r.center().x(), "y": r.y() + PX * 2, "life": 0.6,
+                                   "vx": random.uniform(-70, 70), "vy": random.uniform(-150, -60), "t0": now})
+
+    def puff(self, n: int = 3):
+        """成年菌从菌盖顶上飘出几粒孢子尘"""
+        now = time.time()
+        r = self.sprite_rect
+        for i in range(n):
+            self.particles.append({"kind": "mote", "x": r.x() + random.uniform(0.3, 0.7) * r.width(),
+                                   "y": r.y() + PX * 3, "vx": random.uniform(-6, 6), "vy": random.uniform(-17, -11),
+                                   "t0": now + i * 0.3, "life": 2.4, "wob": random.uniform(0, 6.3)})
+        self.update_mask()
+
+    # ── 待机 ──
+    def touch(self):
+        """有人理它：刷新计时，睡着的话醒过来"""
+        self.last_touch = time.time()
+        if self.asleep:
+            self.asleep = False
+            self.floaters = [f for f in self.floaters if not f["ambient"]]
+            self.idle_at = self.last_touch + random.uniform(*IDLE_GAP)
+            self.play("hop")
+            self.say("!")
+
+    def breathing_out(self, now: float) -> bool:
+        period = BREATH_PERIOD * (1.6 if self.asleep else 1.0)
+        return (now + self.phase) % period > period * 0.55
+
+    def idle(self, now: float):
+        busy = self.anim or self.press or self.flight or self.drag_over or self.hover
+        if not self.asleep and not busy and now - self.last_touch > self.colony.sleep_after():
+            self.asleep = True
+            self.z_at = now + 0.8
+        if self.asleep:
+            if now >= self.z_at:
+                self.z_n += 1
+                self.say("Z" if self.z_n % 3 == 0 else "z", ambient=True)
+                self.z_at = now + 1.4
+            return
+        if busy or now < self.idle_at:
+            return
+        self.idle_at = now + random.uniform(*IDLE_GAP)
+        acts = IDLE_WEIGHTS[self.c.stage]
+        self.do_idle(random.choices([a for a, _ in acts], [w for _, w in acts])[0])
+
+    def do_idle(self, act: str):
+        now = time.time()
+        if act == "blink2":
+            self.blinks = [now, now + 0.3]
+        elif act == "puff":
+            self.puff()
+        else:
+            self.play(act)
 
     def fly(self, start: tuple[int, int], end: tuple[int, int], delay: float = 0.0, dur: float = 0.75):
         self.flight = {"a": start, "b": end, "t0": time.time() + delay, "dur": dur}
@@ -472,6 +577,8 @@ class CreatureWidget(QWidget):
             return 0, -PX if int(t * 8) % 2 else 0
         if name == "shake":
             return (PX if int(t * 16) % 2 else -PX), 0
+        if name == "wiggle":
+            return (PX if int(t * 8) % 2 == 0 else -PX) if t < ANIM_DUR["wiggle"] else 0, 0
         if name in ("poke", "hop", "land"):
             k = {"poke": 3, "hop": 1, "land": 1}[name]
             return 0, -round(math.sin(math.pi * min(1.0, t / ANIM_DUR[name])) * k) * PX
@@ -485,8 +592,11 @@ class CreatureWidget(QWidget):
         if c.stage == 0:
             return art_pixmap(0, spore_size(c.nutrition), invert=invert)
         mouth = self.drag_over or (anim == "eat" and int(t * 8) % 2 == 0)
-        blink = self.blink_at <= now < self.blink_at + 0.15
-        return art_pixmap(c.stage, 3, blink, mouth, invert)
+        blink = self.asleep or any(b <= now < b + 0.15 for b in self.blinks)
+        calm = not (mouth or anim in LOUD_ANIMS or self.flight or self.press)
+        breath = calm and self.breathing_out(now)
+        tilt = TILT_STEPS[min(len(TILT_STEPS) - 1, int(t / ANIM_DUR["tilt"] * len(TILT_STEPS)))] if anim == "tilt" else 0
+        return art_pixmap(c.stage, 3, blink, mouth, invert, breath, tilt)
 
     def tick(self):
         now = time.time()
@@ -503,20 +613,20 @@ class CreatureWidget(QWidget):
         if self.anim and now - self.anim[1] > ANIM_DUR[self.anim[0]]:
             self.anim = None
         self.floaters = [f for f in self.floaters if now - f["t0"] < f["dur"]]
-        self.particles = [q for q in self.particles if now - q["t0"] < 0.6]
-        if now > self.blink_at + 0.15:
-            self.blink_at = now + random.uniform(2.5, 7)
-        if now > self.hop_at:
-            if not self.anim and not self.press:
-                self.play("hop")
-            self.hop_at = now + random.uniform(15, 40)
+        self.particles = [q for q in self.particles if now - q["t0"] < q["life"]]
+        self.blinks = [b for b in self.blinks if now < b + 0.15]
+        if not self.blinks:
+            first = now + random.uniform(2.5, 7)
+            self.blinks = [first, first + 0.3] if random.random() < 0.2 else [first]
+        self.idle(now)
         if self.c.stage != self.shown_stage:
             self.refit()
         self.update_mask()
 
-        busy = self.floaters or self.particles or self.flight
+        loud = self.flight or any(not f["ambient"] for f in self.floaters) or any(q["kind"] == "crumb" for q in self.particles)
+        fps = 20 if loud else 10 if (self.floaters or self.particles) else 0
         key = (self.current_pixmap(now).cacheKey(), self.body_offset(now), self.hover, self.drag_over,
-               int(now * 20) if busy else 0, int(now) if self.hover else 0)
+               int(now * fps) if fps else 0, int(now) if self.hover else 0)
         if key != self._key:
             self._key = key
             self.update()
@@ -539,13 +649,28 @@ class CreatureWidget(QWidget):
 
         for q in self.particles:
             t = now - q["t0"]
-            x = q["x"] + q["vx"] * t
-            y = q["y"] + q["vy"] * t + 380 * t * t
-            p.fillRect(int(x) - 3, int(y) - 3, 6, 6, PAPER)
-            p.fillRect(int(x) - 2, int(y) - 2, 4, 4, INK)
+            if t < 0:
+                continue
+            if q["kind"] == "crumb":
+                x, y, paper, ink = q["x"] + q["vx"] * t, q["y"] + q["vy"] * t + 380 * t * t, PAPER, INK
+            else:
+                x = q["x"] + q["vx"] * t + math.sin(q["wob"] + t * 3) * 3
+                y = q["y"] + q["vy"] * t
+                alpha = int(255 * min(1.0, (1 - t / q["life"]) * 2.5))
+                paper, ink = QColor(PAPER), QColor(DUST)
+                paper.setAlpha(alpha)
+                ink.setAlpha(alpha)
+            p.fillRect(int(x) - 3, int(y) - 3, 6, 6, paper)
+            p.fillRect(int(x) - 2, int(y) - 2, 4, 4, ink)
+
+        for f in self.floaters:
+            if f["ambient"] and now >= f["t0"]:
+                k = (now - f["t0"]) / f["dur"]
+                draw_label(p, f["text"], r.right() - 2 + k * 8, r.y() + 8 - k * 28,
+                           ui_font(15 if f["text"] == "Z" else 12), int(255 * min(1.0, (1 - k) * 2)))
 
         top = r.y() - 6
-        active = [f for f in self.floaters if now >= f["t0"]][-1:]
+        active = [f for f in self.floaters if not f["ambient"] and now >= f["t0"]][-1:]
         for f in active:
             k = (now - f["t0"]) / f["dur"]
             alpha = 255 if k < 0.6 else int(255 * (1 - (k - 0.6) / 0.4))
@@ -585,6 +710,7 @@ class CreatureWidget(QWidget):
     def dragEnterEvent(self, e):
         action = self._safe_action(e)
         if self._local_paths(e) and action is not None:
+            self.touch()
             e.setDropAction(action)
             e.accept()
             self.drag_over = True
@@ -618,6 +744,7 @@ class CreatureWidget(QWidget):
     # ── 鼠标 ──
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and not self.flight:
+            self.touch()
             self.press = (e.globalPosition().toPoint(), self.c.x, self.c.y)
             self.moved = False
 
@@ -643,6 +770,7 @@ class CreatureWidget(QWidget):
             self.say(random.choice(["?", "…", "!", "嗯？"]) if self.c.stage else "·")
 
     def enterEvent(self, e):
+        self.touch()
         self.hover = True
         self.update_mask()
         self.update()
@@ -661,6 +789,7 @@ class Colony:
     def __init__(self, data_dir: Path, fast: bool = False):
         self.data_dir = data_dir
         self.save_path = data_dir / "save.json"
+        self.fast = fast
         self.passive_mult = 30 if fast else 1
         self.gain_mult = 3 if fast else 1
         self.widgets: dict[str, CreatureWidget] = {}
@@ -685,6 +814,10 @@ class Colony:
         self.autosave.timeout.connect(self.save)
         self.autosave.start(30_000)
         self.tray = self.make_tray()
+
+    def sleep_after(self) -> float:
+        base = 40 if self.fast else SLEEP_AFTER
+        return base / 5 if time.localtime().tm_hour < 7 else base
 
     # ── 存档 ──
     def default_spot(self) -> tuple[int, int]:
@@ -754,6 +887,7 @@ class Colony:
     def feed(self, widget: CreatureWidget, paths: list[Path]):
         c = widget.c
         before = c.stage
+        widget.touch()
         eaten, rejected = [], []
         for path in paths[:MAX_ITEMS_PER_DROP]:
             food, why = digest(path)
