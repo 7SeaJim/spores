@@ -736,19 +736,19 @@ check("等回复时头上冒 …", w15.thinking and any(f["text"] == "…" for f
 wait(1.5)
 req = seen[-1]
 check("请求 DeepSeek /chat/completions，带 Bearer Key 和模型名", req["path"] == "/chat/completions" and req["auth"] == "Bearer good"
-      and req["body"]["model"] == "deepseek-flash" and req["body"]["messages"][-1] == {"role": "user", "content": "你今天 吃了什么？"})
+      and req["body"]["model"] == "deepseek-flash" and req["body"]["messages"][-1]["content"].startswith("你今天 吃了什么？\n\n【这一句】"))
 sys_prompt = req["body"]["messages"][0]["content"]
 check("人设带宠物状态、要求一句话，不含吃过的文件名", req["body"]["messages"][0]["role"] == "system" and c15.name in sys_prompt
       and "一句话" in sys_prompt and "私密日记" not in sys_prompt)
 bubble = colony15.bubbles.get(c15.id)
-check("回复只留一句话（感叹号换成句号），显示在头顶气泡里", bubble and bubble.text == "今天的 notes.md 好好吃。" and bubble.isVisible() and not w15.thinking)
+check("回复只留一句话（感叹号换成句号、编的文件名换掉），显示在头顶气泡里", bubble and bubble.text == "今天的 那个文件 好好吃。" and bubble.isVisible() and not w15.thinking)
 check("气泡在宠物正上方", abs(bubble.geometry().center().x() - (w15.x() + w15.sprite_rect.center().x())) <= 2
       and bubble.geometry().bottom() <= w15.y() + w15.sprite_rect.y() + 2)
 bubble_grab = (bubble.grab(), w15.grab())
 colony15.send_chat(w15, "还饿吗")
 wait(1.2)
 msgs = seen[-1]["body"]["messages"]
-check("记得上一轮对话", [m["role"] for m in msgs] == ["system", "user", "assistant", "user"] and msgs[2]["content"] == "今天的 notes.md 好好吃。")
+check("记得上一轮对话", [m["role"] for m in msgs] == ["system", "user", "assistant", "user"] and msgs[2]["content"] == "今天的 那个文件 好好吃。" and msgs[1]["content"] == "你今天 吃了什么？")
 check("非思考模式：DeepSeek 关掉思考、限制长度", seen[-1]["body"]["max_tokens"] == 120 and "thinking" not in seen[-1]["body"])
 colony15.chat_cfg["base_url"] = "https://api.deepseek.com"
 body_probe = {}
@@ -866,7 +866,7 @@ colony17.chat_cfg = {"api_key": "x"}
 colony17.send_chat(colony17.widgets[kino2.id], "还记得我问过什么吗")
 wait(0.6)
 F.chat_request = real_request
-check("重启后聊天仍带着之前的对话", captured and [m["content"] for m in captured[0][1:3]] == ["你妈妈是谁", f"是 {mom.name} 呀！"]
+check("重启后聊天仍带着之前的对话", captured and [m["content"] for m in captured[0][1:3]] == ["你妈妈是谁", f"是 {mom.name} 呀。"]
       and all("t" not in m for m in captured[0]))
 real_q = F.QMessageBox.question
 F.QMessageBox.question = lambda *a, **k: F.QMessageBox.StandardButton.Yes
@@ -974,7 +974,7 @@ real_play = w19.play
 w19.play = lambda name: (played.append(name), real_play(name))
 colony19.send_chat(w19, "你今天吃了什么")
 wait(0.6)
-burp_prompt = captured[-1][0]["content"]
+burp_prompt = captured[-1][-1]["content"]
 check("打嗝那一轮才把一块残渣发给模型", "【这一句】打个嗝" in burp_prompt and ("aaa.txt" in burp_prompt or "待办_旧_请勿删除" in burp_prompt))
 check("说「已归档」时抖一下伞，回复清理掉感叹号", colony19.bubbles[c19.id].text == "那个文件夹已归档了。" and played[-1:] == ["shake"])
 F.pick_style = lambda *a, **k: "normal"
@@ -982,7 +982,8 @@ colony19.send_chat(w19, "kino 是谁")
 wait(0.6)
 F.chat_request, F.pick_style = real_request, real_pick
 normal_prompt = captured[-1][0]["content"]
-check("其他轮次不带残渣", "aaa.txt" not in normal_prompt and "待办_旧" not in normal_prompt and "【这一句】正常" in normal_prompt)
+normal_user = captured[-1][-1]["content"]
+check("其他轮次不带残渣", not any(x in normal_prompt + normal_user for x in ("aaa.txt", "待办_旧")) and "【这一句】正常" in normal_user)
 check("人设是文件菇，写明只咬得动 .txt 和 .md、以上次备份为历法", "文件菇" in normal_prompt and "真正咬得动的只有 .txt 和 .md" in normal_prompt
       and "上次备份" in normal_prompt)
 check("记忆里记下每句的说法", [m.get("style") for m in colony19.memory[c19.id] if m["role"] == "assistant"] == ["burp", "normal"])
@@ -990,6 +991,71 @@ check("资料里不出现叠词", not any(re.search(r"(.)\1", v) for v in list(F
 dlg = F.ChatSettings(colony19)
 check("设置里没有风格选项（默认文件菇，不能改）", not hasattr(dlg, "style_box") and not hasattr(F, "CHAT_STYLES"))
 shutdown(colony19)
+
+print("18. 回话不诡异（按你的聊天记录修正）")
+colony20 = F.Colony(root / "save20")
+m20 = colony20.creatures[0]
+w20 = colony20.widgets[m20.id]
+m20.nutrition, m20.satiety = F.STAGES[F.ADULT][1] + 1, 100
+colony20.after_growth(w20, 0)
+for i in range(colony20.mat.n // 3):
+    colony20.mat.bump(i)
+colony20.mat_step()
+colony20.plant_spitter(colony20.mat.index_at("top", 60), quiet=True)
+colony20.patches.append(F.Patch(400, 400))
+colony20.log_event(f"{m20.name} 被喂了 1 份食物（+13 营养，久放的）")
+colony20.log_event("菌毯铺满了屏幕边缘的 25%")                     # 旧存档里的写法
+p20 = colony20.persona(m20)
+dyn = p20[p20.index("【你自己】"):]
+check("资料不报程序数字（3×3、第几代、百分比、次数、营养值）", not re.search(r"3×3|第 \d+ 代|\d+%|\d+ 次|\+\d+ 营养|被喂过 \d", dyn), dyn)
+check("菌毯、喂食、旧存档的百分比都换成它自己的话", "菌毯沿着屏幕边上长了" in dyn and "被喂了一口，久放的" in dyn and "25%" not in dyn)
+check("人设禁止编文件名和照念数字，说明【这一句】不要复述", "不许编文件名" in p20 and "不要报数字" in p20 and "不要复述" in p20)
+check("你的记录「wechat.lnk 和 copy_cabbage_236」：编的文件名、代号被换掉",
+      F.filegu_clean("带回家那条路上埋着 wechat.lnk 和 copy_cabbage_236") == "带回家那条路上埋着 那个文件 和 那边")
+check("你的记录「从 screen_edge 往上」：代号被换掉", "screen_edge" not in F.filegu_clean("从 screen_edge 往上，长过去有一条 .url 的味道。"))
+check("单独的后缀可以说（.log 比 .txt 甜）", F.filegu_clean(".log 比 .txt 甜，这个你知道吧。") == ".log 比 .txt 甜，这个你知道吧。")
+check("程序给的残渣文件名可以说", F.filegu_clean("（嗝）……「aaa.txt」。", allowed=("aaa.txt",)) == "（嗝）……「aaa.txt」。")
+check("模型复述提示时删掉", F.filegu_clean("嗯。【这一句】正常回答") == "嗯。")
+check("超长时在逗号处断开，不把词切一半", F.one_sentence("甲" * 20 + "，" + "乙" * 30) == "甲" * 20 + "……")
+
+captured = []
+real_request = F.chat_request
+F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or "嗯。"
+colony20.chat_cfg = {"api_key": "x"}
+colony20.send_chat(w20, "蘑菇蘑菇，你为什么说话像ai")
+wait(1.4)
+check("问到像不像 AI：程序直接说落点句，不调模型", not captured and colony20.bubbles[m20.id].text in F.LUCID_LINES
+      and colony20.memory[m20.id][-1]["style"] == "lucid")
+colony20.send_chat(w20, "蘑菇蘑菇！")
+wait(0.6)
+check("落点句之后立刻岔回去", captured and "【这一句】立刻岔回去" in captured[-1][-1]["content"])
+colony20.send_chat(w20, "你是不是机器人")
+wait(0.6)
+F.chat_request = real_request
+check("同一段对话里不说第二次落点句", len(captured) == 2 and colony20.memory[m20.id][-1]["style"] != "lucid")
+check("【这一句】贴在对方的话后面，人设里没有，记忆里只存原话",
+      captured[-1][-1]["content"].startswith("你是不是机器人\n\n【这一句】")
+      and not re.search(r"【这一句】(正常|用「|打个嗝|立刻)", captured[-1][0]["content"])
+      and colony20.memory[m20.id][-2]["content"] == "你是不是机器人")
+probe_body = {}
+
+
+def probe2(req, timeout=None):
+    probe_body.update(json.loads(req.data))
+    raise F.urllib.error.URLError("probe")
+
+
+real_open = F.urllib.request.urlopen
+F.urllib.request.urlopen = probe2
+try:
+    F.chat_request({"api_key": "x"}, [{"role": "user", "content": "hi"}])
+except F.ChatError:
+    pass
+F.urllib.request.urlopen = real_open
+check("温度降到 1.0（1.3 时句子容易糊）", probe_body.get("temperature") == 1.0)
+check("旧对话里说漏的数字、编的文件名发出去前洗掉", F.scrub_history("spores，第 1 代，磨着我 23% 的菌边，埋着 wechat.lnk。")
+      == "spores，磨着我一些的菌边，埋着 那个文件。")
+shutdown(colony20)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]

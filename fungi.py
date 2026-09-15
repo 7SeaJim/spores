@@ -136,6 +136,9 @@ FILEGU_MECHANISMS = ("岔轨", "私有常识", "突然具体", "消化中")
 FILEGU_NORMAL = 0.3        # 正常回答的基础概率（程序按最近 10 句的实际比例微调，保持十句两三句）
 FILEGU_LUCID = 0.05        # 一段对话里「落点句」的概率（每段最多一次）
 FILEGU_BURP = 0.2          # 有残渣时，聊天打嗝的概率
+CHAT_TEMPERATURE = 1.0     # 电波要走神但不能散架：1.3 时句子容易糊成一团
+LUCID_LINES = ("你其实不是想删掉它，你是想有人替你留着。", "我知道你不是真的在问蘑菇。")   # 落点句：程序直接说，不交给模型
+LUCID_TRIGGER = re.compile(r"(?<![a-z])ai(?![a-z])|人工智能|机器人|程序|模型|假的|真的吗|真的假的|你是真的|chatgpt|deepseek|gpt", re.I)
 RESIDUE_MAX = 30           # 每只菌最多留多少块残渣（residue.json）
 FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
 食性：以未整理的文件为食——你吃的不是内容，是混乱。命名混乱、重复、久未打开的最好吃；整齐的目录干巴巴；加密的硬；云端的飘着够不到。
@@ -147,10 +150,12 @@ FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
 2. 私有常识：「.log 比 .txt 甜，这个你知道吧。」
 3. 突然具体：抛出一个精确到离谱的细节。
 4. 消化中：说到一半卡住，说自己正在解压。
-残留：你吃完会打嗝，嗝出前主人的碎片——一个文件名、一行字。它不是数据库，它是残渣。只能嗝出程序在【这一句】里给你的那块残渣，不要自己编文件名。
+残留：你吃完会打嗝，嗝出前主人的碎片——一个文件名、一行字。它不是数据库，它是残渣。
+不许编文件名：除了【这一句】里明确给你的那块残渣，不要说出任何具体的文件名、网址、程序名；说到文件只说「那团」「那个文件夹」，或者 .txt、.log、.tmp 这样的后缀。
 硬规则：一句话，不解释，不找补。自称可以是「我」或「我们」。
 禁止：叠词、感叹号、颜文字；不说「数据」「算力」「赛博」这类词——你不懂这些，你只懂好不好吃。
-走神归走神，说到菌落里的成员和发生过的事时，不要和下面的资料矛盾。
+下面的资料是你心里模模糊糊知道的事：可以提到，但不要照着念，不要报数字、百分比、代数、坐标、英文代号。走神归走神，说到菌落里的成员和发生过的事时，不要和资料矛盾。
+对方的话后面会跟一行【这一句】，那是只给你看的说话提示：照做，但不要复述它。
 语气样本：
 - 我今天吃了半层回收站，有点撑，噗。
 - 你桌面右下角那团，已经放到很好吃的程度了。
@@ -168,7 +173,6 @@ STYLE_DIRECTIVES = {
     "突然具体+": "用「突然具体」：抛出一个精确到离谱的细节，就用这块残渣——{year} 年的文件「{name}」。",
     "消化中": "用「消化中」：说到一半卡住，说自己正在解压。",
     "burp": "打个嗝，嗝出这块残渣：「{frag}」，格式像「（嗝）……「{frag}」。」，可以接半句，但不解释是谁的。",
-    "lucid": "掉回来一句完全清醒的落点句，比如「你其实不是想删掉它，你是想有人替你留着。」只说这一句，不解释。",
     "return": "立刻岔回去，像什么都没发生过，比如「……啊，有个 .tmp 在动。」",
 }
 # 口味：命名乱 / 重复 / 放得久 = 肥；已归档 = 干；云盘里的够不到
@@ -179,7 +183,7 @@ CLOUD_DIRS = {"dropbox", "google drive", "googledrive", "icloud drive", "icloudd
               "baidunetdisk", "百度网盘", "nextcloud", "owncloud", "seafile", "mega", "box", "坚果云同步"}
 CHRONICLE_IN_PROMPT = 20   # 聊天时带上最近几条大事记
 MAT_MILESTONES = (0.1, 0.25, 0.5, 0.75, 1.0)
-STAGE_CN = {"spores": "刚冒出来的 3×3 小黑孢子", "sprout": "刚长出菌盖的小芽", "baby": "圆胖的幼年小菇",
+STAGE_CN = {"spores": "刚冒出来的小黑点", "sprout": "刚长出菌盖的小芽", "baby": "圆胖的幼年小菇",
             "young": "长出了小手小脚的少年蘑菇", "adult": "会放孢子的成年蘑菇"}
 MOOD_CN = {"full": "吃饱了", "hungry": "有点饿", "starving": "饿扁了、很虚弱", "dormant": "在休眠"}
 CHAT_TIMEOUT = 20          # 秒
@@ -657,17 +661,44 @@ def one_sentence(text: str, limit: int = CHAT_MAX_CHARS) -> str:
     if m:
         t = t[:m.end()].strip()
     if len(t) > limit:
-        t = t[:limit - 1].rstrip("，,、；;：: ") + "…"
+        cut = max(t.rfind(p, 0, limit - 2) for p in "，,、；;：: ")
+        t = (t[:cut] if cut >= limit // 2 else t[:limit - 2]).rstrip("，,、；;：: ") + "……"
     return t or "……"
 
 
-def filegu_clean(text: str) -> str:
-    """去掉找补的「呢」「啦」、感叹号、颜文字和 emoji"""
-    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]|[(（][^()（）]{0,6}[＾^ω▽・´`°≧≦][^()（）]{0,6}[)）]", "", text)
+FAKE_FILE = re.compile(r"(?<![\w.])[\w\u4e00-\u9fff\-]*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff\-]*\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,5}(?![\w])")
+CODE_NAME = re.compile(r"(?<![\w])[A-Za-z]+(?:_[A-Za-z0-9]+)+(?![\w])")
+
+
+def scrub_history(text: str) -> str:
+    """发给模型的旧对话：它以前说漏的程序数字和编的文件名也洗掉，免得被照着学"""
+    t = filegu_clean(text)
+    t = re.sub(r"\s*\d+\s*%\s*", "一些", t)
+    t = re.sub(r"第\s*\d+\s*代[，,、]?", "", t)
+    return t.replace("3×3", "小小的")
+
+
+def filegu_clean(text: str, allowed: tuple[str, ...] = ()) -> str:
+    """去掉复述的提示、编出来的文件名和英文代号（残渣除外）、找补的「呢」「啦」、感叹号、颜文字和 emoji"""
+    t = re.sub(r"【这一句】.*$", "", text or "").strip()
+    t = FAKE_FILE.sub(lambda m: m.group(0) if any(m.group(0) in a for a in allowed) else "那个文件", t)
+    t = CODE_NAME.sub(lambda m: m.group(0) if any(m.group(0) in a for a in allowed) else "那边", t)
+    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]|[(（][^()（）]{0,6}[＾^ω▽・´`°≧≦][^()（）]{0,6}[)）]", "", t)
     t = re.sub(r"[！!]+", "。", t)
     t = re.sub(r"。{2,}", "。", t)
     t = re.sub(r"[呢啦]+(?=[。？?…]*$)", "", t.strip())
     return t or "……"
+
+
+def session_styles(history: list[dict], now: float | None = None) -> list[str]:
+    """这一段对话（相邻两句隔不到 CHAT_SESSION_GAP）里它用过的说法，新的在前"""
+    session, prev = [], time.time() if now is None else now
+    for m in reversed([m for m in history if m.get("role") == "assistant"]):
+        if prev - m.get("t", 0) > CHAT_SESSION_GAP:
+            break
+        session.append(m.get("style", "normal"))
+        prev = m.get("t", 0)
+    return session
 
 
 def pick_style(history: list[dict], has_residue: bool = False, now: float | None = None, rng=random) -> str:
@@ -678,12 +709,7 @@ def pick_style(history: list[dict], has_residue: bool = False, now: float | None
     last = styles[-1] if styles else None
     if last == "lucid":
         return "return"
-    session, prev = [], now
-    for m in reversed(said):
-        if prev - m.get("t", 0) > CHAT_SESSION_GAP:
-            break
-        session.append(m.get("style", "normal"))
-        prev = m.get("t", 0)
+    session = session_styles(history, now)
     if "lucid" not in session and len(session) >= 3 and rng.random() < FILEGU_LUCID:
         return "lucid"
     if has_residue and last != "burp" and rng.random() < FILEGU_BURP:
@@ -703,7 +729,7 @@ def chat_request(cfg: dict, messages: list[dict], timeout: float = CHAT_TIMEOUT)
     if cfg.get("thinking"):
         body["max_tokens"] = 4000                        # 思考内容也算在 max_tokens 里
     else:
-        body.update(max_tokens=120, temperature=1.3)
+        body.update(max_tokens=120, temperature=CHAT_TEMPERATURE)
         if "deepseek.com" in base:
             body["thinking"] = {"type": "disabled"}      # DeepSeek 默认开思考；一句话闲聊关掉，更快更省
     req = urllib.request.Request(base + "/chat/completions", data=json.dumps(body).encode("utf-8"), method="POST",
@@ -2306,31 +2332,43 @@ class Colony:
         return ("刚刚" if sec < 60 else f"{int(sec // 60)} 分钟前" if sec < 3600
                 else f"{int(sec // 3600)} 小时前" if sec < 86400 else f"{int(sec // 86400)} 天前")
 
-    def persona(self, c: Creature, directive: str = "") -> str:
-        """聊天人设：固定规则在前（方便命中前缀缓存），再拼上此刻的自己、菌落成员、环境和最近发生的事"""
+    @staticmethod
+    def ring_words(frac: float) -> str:
+        return ("刚冒出一点点" if frac < 0.05 else "长了一小圈" if frac < 0.25 else "长了小半圈" if frac < 0.5
+                else "长了大半圈" if frac < 0.75 else "快长满一整圈" if frac < 1 else "长满了一整圈")
+
+    def event_words(self, text: str) -> str:
+        """大事记里的程序数字换成它自己的话"""
+        text = re.sub(r"菌毯铺满了屏幕边缘的 (\d+)%", lambda m: "菌毯沿着屏幕边上" + self.ring_words(int(m.group(1)) / 100), text)
+        text = re.sub(r"被喂了 (\d+) 份食物（\+\d+ 营养(?:，([^）]*))?）",
+                      lambda m: ("被喂了一口" if m.group(1) == "1" else "被喂了好几口") + (f"，{m.group(2)}" if m.group(2) else ""), text)
+        return text
+
+    def persona(self, c: Creature) -> str:
+        """聊天人设：固定规则在前（方便命中前缀缓存），再拼上此刻的自己、菌落成员、环境和最近发生的事——都用它自己的话，不报程序数字"""
         names = {o.id: o.name for o in self.creatures}
-        family = ("你是菌落最早的始祖" if not c.parent and c.gen == 1 else "你是喷孢菌喷出来的野孢子" if c.parent == "spitter"
+        family = ("你是菌落里最早冒出来的那一只" if not c.parent and c.gen == 1 else "你是喷孢菌喷出来的野孢子" if c.parent == "spitter"
                   else f"你的母体是 {names[c.parent]}" if c.parent in names else "你的母体已经不在了")
-        others = [f"- {o.name}：{STAGE_CN[o.stage_name]}，{MOOD_CN[o.mood]}，第 {o.gen} 代，{self.relation(c, o)}，{self.where(c, o)}"
+        age = time.time() - c.born
+        age_words = "刚冒出来不久" if age < 3600 else "冒出来有几个小时了" if age < 86400 else "冒出来好几天了"
+        fed = "还没被喂过" if not c.feeds else "被喂过几口" if c.feeds < 5 else "被喂过好多次"
+        others = [f"- {o.name}：{self.relation(c, o)}，{STAGE_CN[o.stage_name]}，{MOOD_CN[o.mood]}，{self.where(c, o)}"
                   for o in self.creatures if o is not c]
-        world = [f"屏幕边缘的菌毯铺了 {self.mat.coverage() * 100:.0f}%"]
+        world = ["菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied())]
         if self.spitter:
-            st = self.spitter["stats"]
-            world.append(f"菌毯上长着一只不会动的喷孢菌，已经喷了 {self.spitter['shots']} 次孢子"
-                         f"（{st['vanish']} 次消失、{st['mat']} 次变成菌毯、{st['spore']} 次长成新孢子）")
+            world.append("菌毯上长着一只不会动的喷孢菌，隔一阵就往外喷孢子，大多散掉了")
         if self.patches:
-            world.append(f"桌面中间有 {len(self.patches)} 块菌斑")
-        events = [f"- {self.ago(t)}：{text}" for t, text in self.chronicle[-CHRONICLE_IN_PROMPT:]]
+            world.append("桌面中间落了" + ("一块菌斑" if len(self.patches) == 1 else "几块菌斑" if len(self.patches) < 6 else "好多块菌斑"))
+        events = [f"- {self.ago(t)}：{self.event_words(text)}" for t, text in self.chronicle[-CHRONICLE_IN_PROMPT:]]
         return ("你是电脑桌面上的一只黑白像素风真菌宠物，是一只文件菇。"
                 "只回复一句话，一句就完：不超过 30 个字，不换行，不要说自己是 AI。"
                 "下面的资料就是你知道的全部：资料里的每一只菌你都认识；资料里没有的名字和事情就说不知道，不要编。\n\n"
                 + FILEGU_STYLE + "\n\n"
-                f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，第 {c.gen} 代，"
-                f"出生 {fmt_age(time.time() - c.born)}，被喂过 {c.feeds} 次，{family}。\n"
-                f"【菌落成员】一共 {len(self.creatures)} 只：\n" + ("\n".join(others) if others else "- 只有你自己") + "\n"
+                f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，{age_words}，{fed}，{family}。\n"
+                "【菌落成员】\n" + ("\n".join(others) if others else "- 只有你自己") + "\n"
                 "【环境】" + "；".join(world) + "。\n"
                 "【最近发生的事】\n" + ("\n".join(events) if events else "- 还没发生什么") + "\n"
-                f"现在是 {time.strftime('%m-%d %H:%M')}。" + (f"\n【这一句】{directive}" if directive else ""))
+                f"现在是 {time.strftime('%m-%d %H:%M')}。")
 
     def send_chat(self, widget: CreatureWidget, text: str):
         c, text = widget.c, " ".join(text.split())[:200]
@@ -2340,23 +2378,36 @@ class Colony:
         if c.mood == "dormant":
             self.show_bubble(widget, "（休眠中……喂点东西才会醒）", error=True)
             return
-        history = [{"role": m["role"], "content": m["content"]} for m in self.memory.get(c.id, [])[-2 * CHAT_HISTORY:]]
-        style = pick_style(self.memory.get(c.id, []), has_residue=bool(self.residue.get(c.id)))
-        directive = STYLE_DIRECTIVES[style]
-        if style == "burp":
-            directive = directive.format(frag=self.fragment(self.pick_residue(c.id)))
-        elif style == "突然具体" and self.residue.get(c.id) and random.random() < 0.5:
-            piece = self.pick_residue(c.id)
-            directive = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"])
-        messages = [{"role": "system", "content": self.persona(c, directive)}] + history + [{"role": "user", "content": text}]
+        mem = self.memory.get(c.id, [])
+        history = [{"role": m["role"], "content": scrub_history(m["content"]) if m["role"] == "assistant" else m["content"]}
+                   for m in mem[-2 * CHAT_HISTORY:]]
+        said = session_styles(mem)
+        if LUCID_TRIGGER.search(text) and "lucid" not in said and (said[:1] != ["lucid"]):
+            style = "lucid"                               # 问到「你是不是 AI」这种时候，正是落点句的时候
+        else:
+            style = pick_style(mem, has_residue=bool(self.residue.get(c.id)))
         self.chat_pending.add(c.id)
         widget.thinking, widget.think_at = True, 0.0
         widget.update_mask()
-        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style), daemon=True).start()
+        if style == "lucid":                              # 落点句程序直接说，保证说对、每段只一次
+            used = {m["content"] for m in mem if m.get("style") == "lucid"}
+            line = next((x for x in LUCID_LINES if x not in used), random.choice(LUCID_LINES))
+            QTimer.singleShot(900, lambda: self.on_chat_reply(c.id, text, line, "", "lucid"))
+            return
+        directive, allowed = STYLE_DIRECTIVES[style], ()
+        if style == "burp":
+            frag = self.fragment(self.pick_residue(c.id))
+            directive, allowed = directive.format(frag=frag), (frag,)
+        elif style == "突然具体" and self.residue.get(c.id) and random.random() < 0.5:
+            piece = self.pick_residue(c.id)
+            directive, allowed = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"]), (piece["name"],)
+        messages = ([{"role": "system", "content": self.persona(c)}] + history
+                    + [{"role": "user", "content": f"{text}\n\n【这一句】{directive}"}])
+        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style, allowed), daemon=True).start()
 
-    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict, style: str = "normal"):
+    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict, style: str = "normal", allowed: tuple = ()):
         try:
-            reply, err = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT)))), ""
+            reply, err = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), allowed), ""
         except ChatError as e:
             reply, err = "", str(e)
         self.chat_bridge.done.emit(cid, text, reply, err, style)
@@ -2446,7 +2497,7 @@ class Colony:
         occupied = self.mat.occupied()
         for mark in MAT_MILESTONES:
             if occupied >= mark > self.mat_mark:
-                self.log_event("屏幕边缘都铺满了菌毯" if mark >= 1 else f"菌毯铺满了屏幕边缘的 {mark:.0%}")
+                self.log_event("菌毯沿着屏幕边上" + self.ring_words(mark))
                 self.mat_mark = mark
         self.check_spitter()
         if self.spitter_view:
