@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 import random
 import os
 import shutil
@@ -124,9 +125,11 @@ wait(0.2)
 eat_grab = w.grab()
 
 print("4. 长大 → 成年 → 放出 spores")
-for d in folders[:5]:
+for d in folders[:7]:                      # 整整齐齐的文件夹是干巴巴（0.7 倍），喂到成年为止
     colony.feed(w, [d])
-check("文件夹按 txt/md 数量给营养（最多 30）", c.log[-1][2] == 30, str(c.log[-1]))
+    if c.stage == F.ADULT:
+        break
+check("文件夹按 txt/md 数量和口味给营养（整整齐齐的 = 干巴巴 0.7 倍）", c.log[-1][2] == round(30 * 0.7), str(c.log[-1]))
 check("到达 adult", c.stage == F.ADULT, f"{c.stage_name} {c.nutrition:.1f}")
 check("首批放出 2 个 spores", len(colony.creatures) == 3 and c.released == 2)
 kids = [k for k in colony.creatures if k is not c]
@@ -433,7 +436,7 @@ colony9.shoot("mat", (mid[0] + 2, mid[1] + 2))
 wait(2.2)
 check("打中已有菌斑就让它长大，不新开一块", len(colony9.patches) == p0 + 1 and patch.r > r0)
 occ0 = sum(m9.d)
-colony9.shoot("mat", (a9.left() + 30, mid[1]))
+colony9.shoot("mat", (a9.left() + 30, mid[1] + 120))   # 避开前面加满了的左边中点
 wait(2.2)
 check("落在边缘附近就加厚边缘菌毯", sum(m9.d) > occ0 and len(colony9.patches) == p0 + 1)
 colony9.shoot("spore", (mid[0] + 200, mid[1] + 120))
@@ -505,10 +508,11 @@ for rel in ("a.md", "b.txt", "deep/c.md", "deep/deeper/d.txt"):
 (folder / "img" / "x.png").write_bytes(b"p")
 (folder / ".hidden.md").write_text("h")
 n = c11.nutrition
+folder_value = F.digest(folder)[0].value
 colony11.feed(w11, [folder])
 check("文件夹：txt/md 被吃掉，图片和隐藏文件留下",
       not any((folder / rel).exists() for rel in ("a.md", "b.txt", "deep/c.md", "deep/deeper/d.txt"))
-      and (folder / "img" / "x.png").exists() and (folder / ".hidden.md").exists() and c11.nutrition - n == 14)
+      and (folder / "img" / "x.png").exists() and (folder / ".hidden.md").exists() and c11.nutrition - n == folder_value)
 check("吃空的子目录清掉，还有东西的留下", not (folder / "deep").exists() and (folder / "img").exists() and folder.exists())
 only = dz / "only_notes"
 (only / "sub").mkdir(parents=True)
@@ -737,14 +741,14 @@ sys_prompt = req["body"]["messages"][0]["content"]
 check("人设带宠物状态、要求一句话，不含吃过的文件名", req["body"]["messages"][0]["role"] == "system" and c15.name in sys_prompt
       and "一句话" in sys_prompt and "私密日记" not in sys_prompt)
 bubble = colony15.bubbles.get(c15.id)
-check("回复只留一句话，显示在头顶气泡里", bubble and bubble.text == "今天的 notes.md 好好吃！" and bubble.isVisible() and not w15.thinking)
+check("回复只留一句话（感叹号换成句号），显示在头顶气泡里", bubble and bubble.text == "今天的 notes.md 好好吃。" and bubble.isVisible() and not w15.thinking)
 check("气泡在宠物正上方", abs(bubble.geometry().center().x() - (w15.x() + w15.sprite_rect.center().x())) <= 2
       and bubble.geometry().bottom() <= w15.y() + w15.sprite_rect.y() + 2)
 bubble_grab = (bubble.grab(), w15.grab())
 colony15.send_chat(w15, "还饿吗")
 wait(1.2)
 msgs = seen[-1]["body"]["messages"]
-check("记得上一轮对话", [m["role"] for m in msgs] == ["system", "user", "assistant", "user"] and msgs[2]["content"] == "今天的 notes.md 好好吃！")
+check("记得上一轮对话", [m["role"] for m in msgs] == ["system", "user", "assistant", "user"] and msgs[2]["content"] == "今天的 notes.md 好好吃。")
 check("非思考模式：DeepSeek 关掉思考、限制长度", seen[-1]["body"]["max_tokens"] == 120 and "thinking" not in seen[-1]["body"])
 colony15.chat_cfg["base_url"] = "https://api.deepseek.com"
 body_probe = {}
@@ -882,6 +886,110 @@ ids = {k.name: k.id for k in colony18.creatures}
 check("旧存档：推断出始祖、孩子、野孢子", inferred[mom.name] == "" and inferred[puff.name] == ids[mom.name] and inferred[wild.name] == "spitter")
 check("旧存档：补写出生记录", f"{mom.name} 放出了孢子 {puff.name}" in [e[1] for e in colony18.chronicle])
 shutdown(colony18)
+
+print("17. 文件菇（说话风格 + 食性）")
+check("正常名字、刚改过：营养不变", F.taste("周报.md", time.time()) == (1.0, []))
+messy_m, messy_n = F.taste("新建文本文档 (3)_最终版_v7.txt", time.time())
+check("名字乱的更肥", messy_m > 1.0 and "未整理的" in messy_n)
+old_m, old_n = F.taste("aaa.txt", time.mktime((2019, 5, 1, 0, 0, 0, 0, 0, -1)))
+check("久放的更肥", old_m > messy_m - 0.2 and "久放的" in old_n, f"{old_m} {old_n}")
+check("已归档的干", F.taste("2023归档", time.time()) == (0.5, ["已归档"]))
+fz = root / "filegu"
+tidy = fz / "notes_clean"
+tidy.mkdir(parents=True)
+messy = fz / "新建文件夹(3)" / "最终版_真的最终_v7"
+messy.mkdir(parents=True)
+arch = fz / "资料归档"
+arch.mkdir()
+old_time = time.mktime((2019, 5, 1, 0, 0, 0, 0, 0, -1))
+for d in (tidy, messy, arch):
+    for i in range(3):
+        f = d / (f"草稿 ({i}).md" if d is messy else f"note{i}.md")
+        f.write_text("x" * 600)
+        if d is messy:
+            os.utime(f, (old_time, old_time))
+dv = {d.name: F.digest(d)[0] for d in (tidy, messy.parent, arch)}
+check("越乱越肥：新建文件夹(3)/最终版_真的最终_v7 > 整齐的 > 已归档",
+      dv["新建文件夹(3)"].value > dv["notes_clean"].value > dv["资料归档"].value
+      and dv["notes_clean"].taste == ["干巴巴"] and dv["资料归档"].taste == ["已归档"], {k: (v.value, v.taste) for k, v in dv.items()})
+cloud = fz / "Dropbox" / "todo.txt"
+cloud.parent.mkdir()
+cloud.write_text("云")
+check("同步盘里的：飘着，够不到", F.digest(cloud) == (None, "飘着，够不到"))
+
+colony19 = F.Colony(root / "save19")
+c19 = colony19.creatures[0]
+w19 = colony19.widgets[c19.id]
+colony19.feed(w19, [cloud])
+check("同步盘里的文件不吃不删", cloud.exists() and any("够不到" in f["text"] for f in w19.floaters))
+snack = fz / "aaa.txt"
+snack.write_text("\n\n# 待办_旧_请勿删除\n第二行")
+os.utime(snack, (old_time, old_time))
+colony19.feed(w19, [snack])
+res = json.loads((root / "save19" / "residue.json").read_text())[c19.id][-1]
+check("吃掉前留下残渣：文件名、第一行、年份（residue.json 仅本人可读）",
+      not snack.exists() and res["name"] == "aaa.txt" and res["line"] == "待办_旧_请勿删除" and res["year"] == 2019
+      and stat.S_IMODE(os.stat(root / "save19" / "residue.json").st_mode) == 0o600)
+check("喂食飘字带口味，大事记记口味不记文件名", any("久放的" in f["text"] for f in w19.floaters)
+      and "久放的" in colony19.chronicle[-1][1] and "aaa" not in colony19.chronicle[-1][1])
+colony19.burp(w19)
+b19 = colony19.bubbles[c19.id]
+check("本地打嗝：嗝出残渣（不用 API）", b19.text in ("（嗝）……「aaa.txt」。", "（嗝）……「待办_旧_请勿删除」。") and res["burped"] == 0
+      and colony19.residue[c19.id][-1]["burped"] == 1)
+check("回复清理：感叹号、找补的呢啦、emoji", F.filegu_clean("好好吃！") == "好好吃。" and F.filegu_clean("我们记住了呢。") == "我们记住了。"
+      and F.filegu_clean("噗😋。") == "噗。")
+check("「……」不截断句子", F.one_sentence("嗯咕……啊，你问的是上上次备份的事。明天见。") == "嗯咕……啊，你问的是上上次备份的事。")
+
+rng = random.Random(11)
+hist, styles, t0 = [], [], time.time()
+for i in range(3000):
+    st = F.pick_style(hist, has_residue=True, now=t0 + i * 10, rng=rng)
+    hist.append({"role": "assistant", "content": "", "style": st, "t": t0 + i * 10})
+    styles.append(st)
+pairs = list(zip(styles, styles[1:]))
+check("同一个机制、打嗝都不连着用", not any(a == b and a in F.FILEGU_MECHANISMS + ("burp",) for a, b in pairs))
+normal_ratio = sum(1 for x in styles if x == "normal") / len(styles)
+check("十句里两三句正常回答", 0.18 <= normal_ratio <= 0.32, f"{normal_ratio:.2%}")
+check("落点句一段对话最多一次，说完立刻岔回去", styles.count("lucid") <= 1 and all(b == "return" for a, b in pairs if a == "lucid"))
+hist2, per_session, clock = [], [], t0
+for session in range(30):
+    clock += 2 * 3600                                    # 隔两小时，算新的一段
+    styles2 = []
+    for turn in range(20):
+        clock += 10
+        st = F.pick_style(hist2, now=clock, rng=rng)
+        hist2.append({"role": "assistant", "content": "", "style": st, "t": clock})
+        styles2.append(st)
+    per_session.append(styles2.count("lucid"))
+check("每段对话落点句最多一次，隔很久的新一段可以再出现；没残渣不打嗝",
+      max(per_session) <= 1 and sum(per_session) >= 5 and all(h["style"] != "burp" for h in hist2), f"30 段里 {sum(per_session)} 次")
+
+captured = []
+real_request, real_pick = F.chat_request, F.pick_style
+F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or "那个文件夹已归档了！"
+colony19.chat_cfg = {"api_key": "x"}
+F.pick_style = lambda *a, **k: "burp"
+played = []
+real_play = w19.play
+w19.play = lambda name: (played.append(name), real_play(name))
+colony19.send_chat(w19, "你今天吃了什么")
+wait(0.6)
+burp_prompt = captured[-1][0]["content"]
+check("打嗝那一轮才把一块残渣发给模型", "【这一句】打个嗝" in burp_prompt and ("aaa.txt" in burp_prompt or "待办_旧_请勿删除" in burp_prompt))
+check("说「已归档」时抖一下伞，回复清理掉感叹号", colony19.bubbles[c19.id].text == "那个文件夹已归档了。" and played[-1:] == ["shake"])
+F.pick_style = lambda *a, **k: "normal"
+colony19.send_chat(w19, "kino 是谁")
+wait(0.6)
+F.chat_request, F.pick_style = real_request, real_pick
+normal_prompt = captured[-1][0]["content"]
+check("其他轮次不带残渣", "aaa.txt" not in normal_prompt and "待办_旧" not in normal_prompt and "【这一句】正常" in normal_prompt)
+check("人设是文件菇，写明只咬得动 .txt 和 .md、以上次备份为历法", "文件菇" in normal_prompt and "真正咬得动的只有 .txt 和 .md" in normal_prompt
+      and "上次备份" in normal_prompt)
+check("记忆里记下每句的说法", [m.get("style") for m in colony19.memory[c19.id] if m["role"] == "assistant"] == ["burp", "normal"])
+check("资料里不出现叠词", not any(re.search(r"(.)\1", v) for v in list(F.STAGE_CN.values()) + list(F.MOOD_CN.values())))
+dlg = F.ChatSettings(colony19)
+check("设置里没有风格选项（默认文件菇，不能改）", not hasattr(dlg, "style_box") and not hasattr(F, "CHAT_STYLES"))
+shutdown(colony19)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]

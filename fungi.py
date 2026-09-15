@@ -39,6 +39,7 @@ try:
 except ImportError:                      # Windows
     fcntl = None
 
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
@@ -130,11 +131,57 @@ CHAT_MAX_CHARS = 40        # 一句话最多几个字，超出截断
 CHAT_HISTORY = 6           # 每次聊天带上最近几轮对话
 CHAT_MEMORY = 40           # 每只菌在 memory.json 里最多记多少条消息
 CHRONICLE_MAX = 200        # 菌落大事记最多记多少条（存进 save.json）
+CHAT_SESSION_GAP = 1800    # 两次聊天隔多少秒算新的一段对话
+FILEGU_MECHANISMS = ("岔轨", "私有常识", "突然具体", "消化中")
+FILEGU_NORMAL = 0.3        # 正常回答的基础概率（程序按最近 10 句的实际比例微调，保持十句两三句）
+FILEGU_LUCID = 0.05        # 一段对话里「落点句」的概率（每段最多一次）
+FILEGU_BURP = 0.2          # 有残渣时，聊天打嗝的概率
+RESIDUE_MAX = 30           # 每只菌最多留多少块残渣（residue.json）
+FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
+食性：以未整理的文件为食——你吃的不是内容，是混乱。命名混乱、重复、久未打开的最好吃；整齐的目录干巴巴；加密的硬；云端的飘着够不到。
+你嘴小，真正咬得动的只有 .txt 和 .md，别的文件只能闻闻。被你吃掉的文件就没了（在 Windows 上会先落进回收站）。
+量词：一小口缓存、两指头临时文件、半层回收站、三个重复项那么远。夸东西用「未整理的」「松的」「久放的」；贬义只有一个词：「已归档。」
+时间：以「上次备份」为历法，比如「上上次备份的时候」「还有一次备份我就满了」。
+走神有四种方式：
+1. 岔轨到文件系统：揪住对方话里一个词，把它当成路径走掉。
+2. 私有常识：「.log 比 .txt 甜，这个你知道吧。」
+3. 突然具体：抛出一个精确到离谱的细节。
+4. 消化中：说到一半卡住，说自己正在解压。
+残留：你吃完会打嗝，嗝出前主人的碎片——一个文件名、一行字。它不是数据库，它是残渣。只能嗝出程序在【这一句】里给你的那块残渣，不要自己编文件名。
+硬规则：一句话，不解释，不找补。自称可以是「我」或「我们」。
+禁止：叠词、感叹号、颜文字；不说「数据」「算力」「赛博」这类词——你不懂这些，你只懂好不好吃。
+走神归走神，说到菌落里的成员和发生过的事时，不要和下面的资料矛盾。
+语气样本：
+- 我今天吃了半层回收站，有点撑，噗。
+- 你桌面右下角那团，已经放到很好吃的程度了。
+- 嗯咕……啊，你问的是上上次备份的事。
+- 那个文件夹已归档了，干巴巴的，我们不碰。
+- 稍等，正在解压，里面套了四层。
+- 你说的这个词，在我们这儿是一条路径，我顺着走了一会儿。
+- 还有一次备份我就满了，所以现在就说：你很好。
+- 我刚才想起来一个很重要的文件名，然后它掉缓存里了。"""
+STYLE_DIRECTIVES = {
+    "normal": "正常、认真地回答对方（还是文件菇的口吻，一句话）。",
+    "岔轨": "用「岔轨到文件系统」：揪住对方话里一个词，把它当成路径走掉。",
+    "私有常识": "用「私有常识」：理所当然地说一条只有文件菇知道的常识。",
+    "突然具体": "用「突然具体」：抛出一个精确到离谱的细节。",
+    "突然具体+": "用「突然具体」：抛出一个精确到离谱的细节，就用这块残渣——{year} 年的文件「{name}」。",
+    "消化中": "用「消化中」：说到一半卡住，说自己正在解压。",
+    "burp": "打个嗝，嗝出这块残渣：「{frag}」，格式像「（嗝）……「{frag}」。」，可以接半句，但不解释是谁的。",
+    "lucid": "掉回来一句完全清醒的落点句，比如「你其实不是想删掉它，你是想有人替你留着。」只说这一句，不解释。",
+    "return": "立刻岔回去，像什么都没发生过，比如「……啊，有个 .tmp 在动。」",
+}
+# 口味：命名乱 / 重复 / 放得久 = 肥；已归档 = 干；云盘里的够不到
+MESSY_NAME = re.compile(r"\(\d+\)|（\d+）|副本|复件|copy|final|最终|终版|定稿|真的|v\d+|新建|untitled|未命名|无标题|temp|tmp|旧|old|"
+                        r"备份|bak|请勿删除|勿删|待办|草稿|draft|asdf|aaa|qwe|test|测试|\d{6,}", re.I)
+ARCHIVED_NAME = re.compile(r"归档|已整理|archive", re.I)
+CLOUD_DIRS = {"dropbox", "google drive", "googledrive", "icloud drive", "iclouddrive", "icloud", "nutstore", "坚果云",
+              "baidunetdisk", "百度网盘", "nextcloud", "owncloud", "seafile", "mega", "box", "坚果云同步"}
 CHRONICLE_IN_PROMPT = 20   # 聊天时带上最近几条大事记
 MAT_MILESTONES = (0.1, 0.25, 0.5, 0.75, 1.0)
-STAGE_CN = {"spores": "刚冒出来的 3×3 小黑孢子", "sprout": "刚长出菌盖的小芽", "baby": "圆滚滚的幼年小蘑菇",
+STAGE_CN = {"spores": "刚冒出来的 3×3 小黑孢子", "sprout": "刚长出菌盖的小芽", "baby": "圆胖的幼年小菇",
             "young": "长出了小手小脚的少年蘑菇", "adult": "会放孢子的成年蘑菇"}
-MOOD_CN = {"full": "吃得饱饱的", "hungry": "有点饿", "starving": "饿扁了、很虚弱", "dormant": "在休眠"}
+MOOD_CN = {"full": "吃饱了", "hungry": "有点饿", "starving": "饿扁了、很虚弱", "dormant": "在休眠"}
 CHAT_TIMEOUT = 20          # 秒
 CHAT_ERRORS = {400: "请求格式不对", 401: "API Key 不对", 402: "DeepSeek 余额不足", 422: "参数不对，检查模型名",
                429: "说太快了，等等", 500: "DeepSeek 那边出错了", 503: "DeepSeek 太忙了"}
@@ -420,6 +467,7 @@ class Food:
     key: str
     note: str = ""
     targets: list[Path] = field(default_factory=list)   # 吞噬时要吃掉的文件
+    taste: list[str] = field(default_factory=list)      # 口味：未整理的 / 久放的 / 干巴巴 / 已归档 …
     dirs: list[Path] = field(default_factory=list)      # 吃完后尝试清掉的空目录（深的在前）
 
 
@@ -454,6 +502,67 @@ def count_edible(root: Path, max_depth: int = 3, budget: int = 3000) -> int:
     return len(find_edible(root, max_depth, budget)[0])
 
 
+def folder_taste(root: Path, files: list[Path]) -> tuple[float, list[str]]:
+    """文件夹的口味：名字或路径里有「归档」就干；里外都整整齐齐、全是新的就干巴巴；越乱越肥"""
+    if ARCHIVED_NAME.search(root.name) or any(ARCHIVED_NAME.search(p) for f in files for p in f.relative_to(root).parts[:-1]):
+        return 0.5, ["已归档"]
+    mults, notes = [], set()
+    for f in files[:200]:
+        try:
+            m, n = taste(str(f.relative_to(root)), f.stat().st_mtime)
+        except OSError:
+            continue
+        mults.append(m)
+        notes.update(n)
+    own, own_notes = taste(root.name, time.time())
+    notes.update(own_notes)
+    avg = (sum(mults) / len(mults) if mults else 1.0) + (own - 1.0)
+    if avg <= 1.0:
+        return 0.7, ["干巴巴"]
+    order = ["未整理的", "松的", "久放的", "放了一阵的"]
+    return min(1.6, avg), [n for n in order if n in notes][:2]
+
+
+def taste(name: str, mtime: float, now: float | None = None) -> tuple[float, list[str]]:
+    """文件菇的口味（营养倍率, 形容词）：命名乱、重复、放得久的肥；已归档的干"""
+    if ARCHIVED_NAME.search(name):
+        return 0.5, ["已归档"]
+    notes, score = [], 0.0
+    hits = len({m.group(0).lower() for m in MESSY_NAME.finditer(name)})
+    if hits:
+        score += min(2, hits) * 0.25
+        notes.append("未整理的" if hits >= 2 else "松的")
+    age = ((now or time.time()) - mtime) / 86400
+    if age > 365:
+        score += 0.35
+        notes.append("久放的")
+    elif age > 90:
+        score += 0.15
+        notes.append("放了一阵的")
+    return min(1.6, 1.0 + score), notes
+
+
+def in_cloud(path: Path) -> bool:
+    """在同步盘目录里（删了会连带删掉云端）：飘着，够不到"""
+    try:
+        parts = path.resolve().parts
+    except OSError:
+        parts = path.parts
+    return any(p.lower() in CLOUD_DIRS or p.lower().startswith(("onedrive", "dropbox")) for p in parts)
+
+
+def residue_of(path: Path) -> dict | None:
+    """吃之前留一块残渣：文件名、第一行字、年份"""
+    try:
+        st = path.stat()
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    line = next((s[:24] for s in (raw.strip().lstrip("#>-*/ ").strip() for raw in head.decode("utf-8", "ignore").splitlines()) if s), "")
+    return {"name": path.name[:40], "line": line, "year": time.localtime(st.st_mtime).tm_year, "burped": 0}
+
+
 def digest(path: Path) -> tuple[Food | None, str]:
     """把一个路径变成食物。只看 stat 和目录结构，不读文件内容；真正吃掉（删除）由 Colony.devour 做。"""
     try:
@@ -461,15 +570,20 @@ def digest(path: Path) -> tuple[Food | None, str]:
     except OSError:
         return None, "够不着…"
     key = hashlib.sha1(f"{os.path.realpath(path)}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:16]
+    if in_cloud(path):
+        return None, "飘着，够不到"
     if path.is_dir():
         files, dirs = find_edible(path)
         if not files:
-            return Food(path.name + "/", 3, key, "空空的", [], dirs), ""
-        return Food(path.name + "/", min(30, 6 + 2 * len(files)), key, "", files, dirs), ""
+            return Food(path.name + "/", 3, key, "空空的", [], dirs=dirs), ""
+        mult, notes = folder_taste(path, files)
+        return Food(path.name + "/", max(1, round(min(30, 6 + 2 * len(files)) * mult)), key, "", files, dirs=dirs, taste=notes), ""
     if path.suffix.lower() in EDIBLE_EXT:
         if st.st_size == 0:
             return Food(path.name, 2, key, "空的…", [path]), ""
-        return Food(path.name, min(20, 4 + int(3 * math.log2(st.st_size / 256 + 1))), key, "", [path]), ""
+        mult, notes = taste(path.name, st.st_mtime)
+        base = min(20, 4 + int(3 * math.log2(st.st_size / 256 + 1)))
+        return Food(path.name, max(1, round(base * mult)), key, "", [path], taste=notes), ""
     return None, f"不吃 {path.suffix or path.name}"
 
 
@@ -539,12 +653,47 @@ class ChatError(Exception):
 def one_sentence(text: str, limit: int = CHAT_MAX_CHARS) -> str:
     """只留第一句话，最多 limit 个字"""
     t = " ".join((text or "").split()).strip().strip('"“”「」『』')
-    m = re.search(r"[。！？!?…]+|(?<!\d)\.(?=\s|$)", t)
+    m = re.search(r"[。！？!?]+|(?<!\d)\.(?=\s|$)", t)        # 「……」不算句子结束
     if m:
         t = t[:m.end()].strip()
     if len(t) > limit:
         t = t[:limit - 1].rstrip("，,、；;：: ") + "…"
     return t or "……"
+
+
+def filegu_clean(text: str) -> str:
+    """去掉找补的「呢」「啦」、感叹号、颜文字和 emoji"""
+    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]|[(（][^()（）]{0,6}[＾^ω▽・´`°≧≦][^()（）]{0,6}[)）]", "", text)
+    t = re.sub(r"[！!]+", "。", t)
+    t = re.sub(r"。{2,}", "。", t)
+    t = re.sub(r"[呢啦]+(?=[。？?…]*$)", "", t.strip())
+    return t or "……"
+
+
+def pick_style(history: list[dict], has_residue: bool = False, now: float | None = None, rng=random) -> str:
+    """这一句怎么说：不连续用同一个机制，十句里两三句正常，有残渣才会打嗝，一段对话最多一次落点句，落点句后立刻岔回去"""
+    now = time.time() if now is None else now
+    said = [m for m in history if m.get("role") == "assistant"]
+    styles = [m.get("style", "normal") for m in said]
+    last = styles[-1] if styles else None
+    if last == "lucid":
+        return "return"
+    session, prev = [], now
+    for m in reversed(said):
+        if prev - m.get("t", 0) > CHAT_SESSION_GAP:
+            break
+        session.append(m.get("style", "normal"))
+        prev = m.get("t", 0)
+    if "lucid" not in session and len(session) >= 3 and rng.random() < FILEGU_LUCID:
+        return "lucid"
+    if has_residue and last != "burp" and rng.random() < FILEGU_BURP:
+        return "burp"
+    recent = styles[-9:]
+    normals = recent.count("normal")
+    chance = 0.0 if normals >= 3 else 0.6 if normals == 0 and len(recent) >= 6 else FILEGU_NORMAL
+    if rng.random() < chance:
+        return "normal"
+    return rng.choice([m for m in FILEGU_MECHANISMS if m != last])
 
 
 def chat_request(cfg: dict, messages: list[dict], timeout: float = CHAT_TIMEOUT) -> str:
@@ -1599,7 +1748,7 @@ class PatchView(QWidget):
 
 class ChatBridge(QObject):
     """后台线程把回复送回界面线程"""
-    done = pyqtSignal(str, str, str, str)                # 菌 id, 你说的话, 回复, 错误
+    done = pyqtSignal(str, str, str, str, str)           # 菌 id, 你说的话, 回复, 错误, 这一句的说法
 
 
 class SpeechBubble(QWidget):
@@ -1621,10 +1770,10 @@ class SpeechBubble(QWidget):
         self.resize(box.width() + 2 + 2 * self.PAD, box.height() + 2 * self.PAD + self.TAIL)
         self.t0, self.dur = time.time(), min(10.0, 3.0 + len(text) * 0.15)
         self.done = False
-        self.follow()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(50)
+        self.follow()
 
     def follow(self):
         o = self.owner
@@ -1741,7 +1890,7 @@ class ChatSettings(QDialog):
         form.addRow("模型", self.model)
         form.addRow("", self.thinking)
         note = QLabel(f"Key 只保存在本机：{colony.chat_path}（仅本人可读）。\n"
-                      "发给 DeepSeek 的只有你说的话和宠物的状态（阶段、饿不饿、菌落大小），不含吃过的文件名。")
+                      "发给 DeepSeek 的是你说的话、菌落的状态；它打嗝的那一句会带上一块残渣（吃掉的某个文件名或第一行字）。")
         note.setWordWrap(True)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1795,6 +1944,8 @@ class Colony:
         self.memory_path = data_dir / "memory.json"
         self.memory: dict[str, list[dict]] = self.load_memory()
         self.chronicle: list[list] = []
+        self.residue_path = data_dir / "residue.json"
+        self.residue: dict[str, list[dict]] = self.load_private(self.residue_path)
         self.moods: dict[str, str] = {}
         self.mat_mark = 0.0
         self.chat_pending: set[str] = set()
@@ -2078,21 +2229,56 @@ class Colony:
                     self.log_event(f"{c.name} 被喂饱，活过来了")
             self.moods[c.id] = new
 
-    def load_memory(self) -> dict[str, list[dict]]:
+    @staticmethod
+    def load_private(path: Path) -> dict[str, list[dict]]:
         try:
-            data = json.loads(self.memory_path.read_text("utf-8"))
+            data = json.loads(path.read_text("utf-8"))
             return {k: v for k, v in data.items() if isinstance(v, list)}
         except (OSError, ValueError, AttributeError):
             return {}
 
-    def save_memory(self):
+    def write_private(self, path: Path, data: dict):
+        """聊天记忆、残渣这类私人东西：原子写入，权限 600"""
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.memory_path.with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(self.memory, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.memory_path)
-        os.chmod(self.memory_path, 0o600)
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+
+    def load_memory(self) -> dict[str, list[dict]]:
+        return self.load_private(self.memory_path)
+
+    def save_memory(self):
+        self.write_private(self.memory_path, self.memory)
+
+    def keep_residue(self, c: Creature, pieces: list[dict]):
+        if pieces:
+            self.residue[c.id] = (self.residue.get(c.id, []) + pieces)[-RESIDUE_MAX:]
+            self.write_private(self.residue_path, self.residue)
+
+    def pick_residue(self, cid: str) -> dict | None:
+        """嗝得最少的那块残渣（同样少就挑新的）"""
+        pieces = self.residue.get(cid, [])
+        if not pieces:
+            return None
+        piece = min(reversed(pieces), key=lambda r: r.get("burped", 0))
+        piece["burped"] = piece.get("burped", 0) + 1
+        self.write_private(self.residue_path, self.residue)
+        return piece
+
+    @staticmethod
+    def fragment(piece: dict) -> str:
+        return piece["line"] if piece.get("line") and random.random() < 0.5 else piece["name"]
+
+    def burp(self, widget: CreatureWidget):
+        """本地打嗝：嗝出一块残渣，不用 API"""
+        if sip.isdeleted(widget) or self.widgets.get(widget.c.id) is not widget:   # 喂完就被放生 / 菌落关了
+            return
+        piece = self.pick_residue(widget.c.id)
+        if piece:
+            self.show_bubble(widget, f"（嗝）……「{self.fragment(piece)}」。")
 
     def relation(self, me: Creature, other: Creature) -> str:
         if other.id == me.parent:
@@ -2120,7 +2306,7 @@ class Colony:
         return ("刚刚" if sec < 60 else f"{int(sec // 60)} 分钟前" if sec < 3600
                 else f"{int(sec // 3600)} 小时前" if sec < 86400 else f"{int(sec // 86400)} 天前")
 
-    def persona(self, c: Creature) -> str:
+    def persona(self, c: Creature, directive: str = "") -> str:
         """聊天人设：固定规则在前（方便命中前缀缓存），再拼上此刻的自己、菌落成员、环境和最近发生的事"""
         names = {o.id: o.name for o in self.creatures}
         family = ("你是菌落最早的始祖" if not c.parent and c.gen == 1 else "你是喷孢菌喷出来的野孢子" if c.parent == "spitter"
@@ -2135,16 +2321,16 @@ class Colony:
         if self.patches:
             world.append(f"桌面中间有 {len(self.patches)} 块菌斑")
         events = [f"- {self.ago(t)}：{text}" for t, text in self.chronicle[-CHRONICLE_IN_PROMPT:]]
-        return ("你是电脑桌面上的一只黑白像素风真菌宠物，靠吃电脑里的 .txt 和 .md 文件长大。"
-                "用中文回答，语气像一只好奇、有点呆的小蘑菇，符合你现在的状态。"
-                "只回复一句话，不超过 30 个字，不换行，不用表情符号，不要说自己是 AI。"
+        return ("你是电脑桌面上的一只黑白像素风真菌宠物，是一只文件菇。"
+                "只回复一句话，一句就完：不超过 30 个字，不换行，不要说自己是 AI。"
                 "下面的资料就是你知道的全部：资料里的每一只菌你都认识；资料里没有的名字和事情就说不知道，不要编。\n\n"
+                + FILEGU_STYLE + "\n\n"
                 f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，第 {c.gen} 代，"
                 f"出生 {fmt_age(time.time() - c.born)}，被喂过 {c.feeds} 次，{family}。\n"
                 f"【菌落成员】一共 {len(self.creatures)} 只：\n" + ("\n".join(others) if others else "- 只有你自己") + "\n"
                 "【环境】" + "；".join(world) + "。\n"
                 "【最近发生的事】\n" + ("\n".join(events) if events else "- 还没发生什么") + "\n"
-                f"现在是 {time.strftime('%m-%d %H:%M')}。")
+                f"现在是 {time.strftime('%m-%d %H:%M')}。" + (f"\n【这一句】{directive}" if directive else ""))
 
     def send_chat(self, widget: CreatureWidget, text: str):
         c, text = widget.c, " ".join(text.split())[:200]
@@ -2155,20 +2341,27 @@ class Colony:
             self.show_bubble(widget, "（休眠中……喂点东西才会醒）", error=True)
             return
         history = [{"role": m["role"], "content": m["content"]} for m in self.memory.get(c.id, [])[-2 * CHAT_HISTORY:]]
-        messages = [{"role": "system", "content": self.persona(c)}] + history + [{"role": "user", "content": text}]
+        style = pick_style(self.memory.get(c.id, []), has_residue=bool(self.residue.get(c.id)))
+        directive = STYLE_DIRECTIVES[style]
+        if style == "burp":
+            directive = directive.format(frag=self.fragment(self.pick_residue(c.id)))
+        elif style == "突然具体" and self.residue.get(c.id) and random.random() < 0.5:
+            piece = self.pick_residue(c.id)
+            directive = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"])
+        messages = [{"role": "system", "content": self.persona(c, directive)}] + history + [{"role": "user", "content": text}]
         self.chat_pending.add(c.id)
         widget.thinking, widget.think_at = True, 0.0
         widget.update_mask()
-        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg)), daemon=True).start()
+        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style), daemon=True).start()
 
-    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict):
+    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict, style: str = "normal"):
         try:
-            reply, err = one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), ""
+            reply, err = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT)))), ""
         except ChatError as e:
             reply, err = "", str(e)
-        self.chat_bridge.done.emit(cid, text, reply, err)
+        self.chat_bridge.done.emit(cid, text, reply, err, style)
 
-    def on_chat_reply(self, cid: str, text: str, reply: str, err: str):
+    def on_chat_reply(self, cid: str, text: str, reply: str, err: str, style: str = "normal"):
         self.chat_pending.discard(cid)
         w = self.widgets.get(cid)
         if w is None:
@@ -2180,11 +2373,13 @@ class Colony:
             return
         now = int(time.time())
         history = self.memory.setdefault(cid, [])
-        history += [{"role": "user", "content": text, "t": now}, {"role": "assistant", "content": reply, "t": now}]
+        history += [{"role": "user", "content": text, "t": now}, {"role": "assistant", "content": reply, "t": now, "style": style}]
         del history[:-CHAT_MEMORY]
         self.save_memory()
         self.show_bubble(w, reply)
-        if w.c.mood == "full":
+        if "已归档" in reply:
+            w.play("shake")                               # 说「已归档」的时候抖一下伞
+        elif w.c.mood == "full":
             w.play("hop")
 
     def show_bubble(self, widget: CreatureWidget, text: str, error: bool = False) -> SpeechBubble:
@@ -2518,6 +2713,8 @@ class Colony:
             if food is None:
                 rejected.append(why)
                 continue
+            safe = [t for t in food.targets if not self.is_protected(t)]
+            pieces = [p for p in (residue_of(t) for t in random.sample(safe, min(2, len(safe)))) if p]
             if self.devour:
                 if food.targets and all(self.is_protected(t) for t in food.targets):
                     rejected.append("这个不能吃")
@@ -2528,7 +2725,9 @@ class Colony:
                     continue
                 if done < len(food.targets):
                     food.value = max(1, round(food.value * done / len(food.targets)))
-            value, note = food.value, food.note
+            value, note = food.value, food.note or "、".join(food.taste[:2])
+            if self.devour:
+                self.keep_residue(c, pieces)
             if food.key in c.eaten:
                 value, note = max(1, value // 4), note or "嚼过了"
             else:
@@ -2545,12 +2744,21 @@ class Colony:
         if len(paths) > MAX_ITEMS_PER_DROP:
             rejected.append("吃不下了")
         if eaten:
-            self.log_event(f"{c.name} 被喂了 {len(eaten)} 份食物（+{sum(v for v, _ in eaten)} 营养）")
+            tastes = [n for _, n in eaten if n and n not in ("嚼过了",)]
+            self.log_event(f"{c.name} 被喂了 {len(eaten)} 份食物（+{sum(v for v, _ in eaten)} 营养"
+                           + (f"，{'、'.join(dict.fromkeys(tastes))}" if tastes else "") + "）")
             self.track_moods()
 
         if eaten:
             widget.play("eat")
             widget.crumbs()
+            if any(n == "已归档" for _, n in eaten):
+                QTimer.singleShot(900, lambda: widget.play("shake"))
+            if self.devour and self.residue.get(c.id):
+                if random.random() < 0.35:
+                    QTimer.singleShot(random.randint(2500, 4500), lambda: self.burp(widget))
+                else:
+                    widget.say("嗝", delay=2.0)
             for i, (value, note) in enumerate(eaten):
                 widget.say(f"+{value} {note}".strip(), delay=i * 0.35)
             if rejected:
