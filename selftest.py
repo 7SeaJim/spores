@@ -576,7 +576,9 @@ w.idle(time.time())
 check("饿扁了不蹦跶，只会嘟囔或眨眼", w.anim is None)
 c.satiety, c.nutrition = 20, 60
 w.tick()
-hungry_img = w.current_pixmap(time.time()).toImage()
+now = time.time()
+w.blinks, w.anim, w.idle_at = [now + 100], None, now + 100      # 排除眨眼和小动作的干扰
+hungry_img = w.current_pixmap(now).toImage()
 check("饿了用专门的帧（不变灰）",
       hungry_img in [F.art_pixmap(2, 3, False, False, False, b, 0, False, "hungry").toImage() for b in (False, True)]
       and F.art_pixmap(2, 3, False, False, False, False, 0, False, "hungry").toImage() != F.art_pixmap(2).toImage())
