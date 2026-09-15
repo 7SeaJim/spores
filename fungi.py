@@ -12,7 +12,7 @@ FUNGI.EXE — 桌面真菌宠物（最小闭环 demo）
 操作:
     拖文件 / 文件夹到它身上 = 喂食：能吃的 .txt / .md 会被真的吃掉（Linux 等直接删除，Windows 移到回收站），
                                   吃掉的完整路径记在存档目录的 eaten.log；右键可关掉「吞噬文件」
-    左键拖动 = 搬家    单击 = 戳一下    右键 = 状态和菜单
+    左键拖动 = 搬家    单击 = 戳一下    双击 = 聊天（DeepSeek，自己填 API Key）    右键 = 状态和菜单
 """
 from __future__ import annotations
 
@@ -23,9 +23,13 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
@@ -35,10 +39,11 @@ try:
 except ImportError:                      # Windows
     fcntl = None
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon, QWidget
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+                             QLabel, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 # ───────────────────────────── 可调参数 ─────────────────────────────
 
@@ -117,6 +122,15 @@ MOOD_NAMES = {"full": "", "hungry": "饿", "starving": "饿扁了", "dormant": "
 
 DEVOUR = True              # 默认吞噬文件（右键菜单可关）
 PROJECT_DIR = Path(__file__).resolve().parent
+
+# 聊天：DeepSeek（OpenAI 兼容的 /chat/completions），API Key 由用户自己填
+CHAT_BASE_URL = "https://api.deepseek.com"
+CHAT_MODELS = ("deepseek-flash", "deepseek-v4-pro")
+CHAT_MAX_CHARS = 40        # 一句话最多几个字，超出截断
+CHAT_HISTORY = 6           # 每只菌记住最近几轮对话（只在内存里）
+CHAT_TIMEOUT = 20          # 秒
+CHAT_ERRORS = {400: "请求格式不对", 401: "API Key 不对", 402: "DeepSeek 余额不足", 422: "参数不对，检查模型名",
+               429: "说太快了，等等", 500: "DeepSeek 那边出错了", 503: "DeepSeek 太忙了"}
 
 EDIBLE_EXT = {".txt", ".md"}
 MAX_ITEMS_PER_DROP = 5
@@ -510,6 +524,48 @@ def foreground_fullscreen() -> bool:
     return rect.left <= m.left and rect.top <= m.top and rect.right >= m.right and rect.bottom >= m.bottom
 
 
+class ChatError(Exception):
+    pass
+
+
+def one_sentence(text: str, limit: int = CHAT_MAX_CHARS) -> str:
+    """只留第一句话，最多 limit 个字"""
+    t = " ".join((text or "").split()).strip().strip('"“”「」『』')
+    m = re.search(r"[。！？!?…]+|(?<!\d)\.(?=\s|$)", t)
+    if m:
+        t = t[:m.end()].strip()
+    if len(t) > limit:
+        t = t[:limit - 1].rstrip("，,、；;：: ") + "…"
+    return t or "……"
+
+
+def chat_request(cfg: dict, messages: list[dict], timeout: float = CHAT_TIMEOUT) -> str:
+    """调 DeepSeek /chat/completions，返回回复文本；出错抛 ChatError（带给用户看的原因）"""
+    body = {"model": cfg.get("model") or CHAT_MODELS[0], "messages": messages, "stream": False}
+    base = (cfg.get("base_url") or CHAT_BASE_URL).rstrip("/")
+    if cfg.get("thinking"):
+        body["max_tokens"] = 4000                        # 思考内容也算在 max_tokens 里
+    else:
+        body.update(max_tokens=120, temperature=1.3)
+        if "deepseek.com" in base:
+            body["thinking"] = {"type": "disabled"}      # DeepSeek 默认开思考；一句话闲聊关掉，更快更省
+    req = urllib.request.Request(base + "/chat/completions", data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {cfg.get('api_key', '')}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        raise ChatError(CHAT_ERRORS.get(err.code, f"出错了（{err.code}）")) from err
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        raise ChatError("连不上…") from err
+    except ValueError as err:
+        raise ChatError("听不懂回话") from err
+    try:
+        return data["choices"][0]["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError, AttributeError) as err:
+        raise ChatError("听不懂回话") from err
+
+
 def fmt_age(sec: float) -> str:
     sec = int(max(0, sec))
     d, sec = divmod(sec, 86400)
@@ -590,6 +646,8 @@ class CreatureWidget(QWidget):
         self.z_at = 0.0
         self.z_n = 0
         self.shown_mood = creature.mood
+        self.thinking = False                 # 正在等聊天回复
+        self.think_at = 0.0
         self._key = None
         self.sprite_rect = QRect()
 
@@ -686,6 +744,9 @@ class CreatureWidget(QWidget):
         return (now + self.phase) % period > period * 0.55
 
     def idle(self, now: float):
+        if self.thinking and now >= self.think_at:
+            self.say("…", ambient=True)
+            self.think_at = now + 0.9
         if self.c.mood == "dormant":                    # 休眠孢子：一动不动，等人喂
             self.asleep = False
             return
@@ -941,6 +1002,10 @@ class CreatureWidget(QWidget):
     def leaveEvent(self, e):
         self.hover = False
         self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.colony.open_chat(self)
 
     def contextMenuEvent(self, e):
         self.colony.show_menu(self, e.globalPos())
@@ -1522,6 +1587,172 @@ class PatchView(QWidget):
         p.end()
 
 
+# ───────────────────────────── 聊天界面 ─────────────────────────────
+
+class ChatBridge(QObject):
+    """后台线程把回复送回界面线程"""
+    done = pyqtSignal(str, str, str, str)                # 菌 id, 你说的话, 回复, 错误
+
+
+class SpeechBubble(QWidget):
+    """宠物头顶的像素对话气泡：自动换行、跟着宠物走、几秒后淡出，鼠标穿透"""
+    MAX_W, PAD, TAIL = 240, 10, 8
+
+    def __init__(self, owner: "CreatureWidget", text: str, error: bool = False):
+        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput
+                 | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.NoDropShadowWindowHint)
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowTitle("fungi · bubble")
+        self.owner, self.text, self.error = owner, text, error
+        self.font_ = ui_font(13)
+        box = QFontMetrics(self.font_).boundingRect(QRect(0, 0, self.MAX_W, 2000),
+                                                    int(Qt.TextFlag.TextWrapAnywhere), text)
+        self.text_rect = QRect(self.PAD, self.PAD, box.width() + 2, box.height())
+        self.resize(box.width() + 2 + 2 * self.PAD, box.height() + 2 * self.PAD + self.TAIL)
+        self.t0, self.dur = time.time(), min(10.0, 3.0 + len(text) * 0.15)
+        self.done = False
+        self.follow()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(50)
+
+    def follow(self):
+        o = self.owner
+        try:
+            x = o.x() + o.sprite_rect.center().x() - self.width() / 2
+            y = o.y() + o.sprite_rect.y() - self.height() + 2
+        except RuntimeError:                              # 宠物窗口已经没了
+            self.finish()
+            return
+        screen = QGuiApplication.screenAt(QPoint(int(x + self.width() / 2), int(y + self.height()))) or QGuiApplication.primaryScreen()
+        if screen:
+            a = screen.availableGeometry()
+            x = min(max(x, a.left() + 4), a.right() - self.width() - 4)
+            y = max(y, a.top() + 4)
+        self.move(int(x), int(y))
+
+    def finish(self):
+        self.done = True
+        self.timer.stop()
+        self.close()
+
+    def tick(self):
+        k = time.time() - self.t0
+        if k > self.dur:
+            self.finish()
+            return
+        self.setWindowOpacity(1.0 if k < self.dur - 0.6 else max(0.0, (self.dur - k) / 0.6))
+        self.follow()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        w, h = self.width(), self.height() - self.TAIL
+        p.fillRect(2, 0, w - 4, h, INK)                   # 描边（切掉四角，像素圆角）
+        p.fillRect(0, 2, w, h - 4, INK)
+        p.fillRect(2, 2, w - 4, h - 4, PAPER)
+        cx = w // 2
+        for i, half in enumerate((6, 4, 2)):             # 往下的小尾巴
+            p.fillRect(cx - half, h - 2 + i * 3, 2 * half, 3, INK)
+            if half > 2:
+                p.fillRect(cx - half + 2, h - 2 + i * 3, 2 * half - 4, 3, PAPER)
+        p.setPen(DUST if self.error else INK)
+        p.setFont(self.font_)
+        p.drawText(self.text_rect, int(Qt.TextFlag.TextWrapAnywhere | Qt.AlignmentFlag.AlignLeft), self.text)
+        p.end()
+
+
+class ChatLine(QLineEdit):
+    def __init__(self, box: "ChatInput"):
+        super().__init__(box)
+        self.box = box
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.box.close()
+        else:
+            super().keyPressEvent(e)
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        QTimer.singleShot(150, self.box.close)
+
+
+class ChatInput(QWidget):
+    """宠物脚下弹出的输入框：回车发送，Esc / 点别处关闭"""
+
+    def __init__(self, colony: "Colony", owner: "CreatureWidget"):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("fungi · chat")
+        self.colony, self.owner = colony, owner
+        self.line = ChatLine(self)
+        self.line.setMaxLength(200)
+        self.line.setPlaceholderText(f"对 {owner.c.name} 说…（回车发送）")
+        self.line.setStyleSheet(f"QLineEdit {{ background:{PAPER.name()}; color:{INK.name()}; border:2px solid {INK.name()};"
+                                f" padding:4px 6px; font-family:'DejaVu Sans Mono','Consolas','Noto Sans CJK SC','Microsoft YaHei UI',monospace;"
+                                f" font-size:13px; font-weight:bold; selection-background-color:{INK.name()}; }}")
+        self.line.returnPressed.connect(self.send)
+        self.resize(260, 34)
+        self.line.setGeometry(0, 0, 260, 34)
+        r = owner.sprite_rect
+        self.move(int(owner.x() + r.center().x() - 130), int(owner.y() + r.bottom() + 6))
+
+    def send(self):
+        text = self.line.text()
+        self.close()
+        self.colony.send_chat(self.owner, text)
+
+    def popup(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.line.setFocus()
+
+
+class ChatSettings(QDialog):
+    def __init__(self, colony: "Colony"):
+        super().__init__(None)
+        self.setWindowTitle("聊天设置 · FUNGI.EXE")
+        self.colony = colony
+        cfg = colony.chat_cfg
+        self.key = QLineEdit(cfg.get("api_key", ""))
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setPlaceholderText("sk-…（也可以设环境变量 DEEPSEEK_API_KEY）")
+        self.base = QLineEdit(cfg.get("base_url") or CHAT_BASE_URL)
+        self.model = QComboBox()
+        self.model.setEditable(True)
+        self.model.addItems(CHAT_MODELS)
+        self.model.setCurrentText(cfg.get("model") or CHAT_MODELS[0])
+        self.thinking = QCheckBox("思考模式（回答更慢、更贵，一句话闲聊一般不需要）")
+        self.thinking.setChecked(bool(cfg.get("thinking")))
+        form = QFormLayout()
+        form.addRow("API Key", self.key)
+        form.addRow("接口地址", self.base)
+        form.addRow("模型", self.model)
+        form.addRow("", self.thinking)
+        note = QLabel(f"Key 只保存在本机：{colony.chat_path}（仅本人可读）。\n"
+                      "发给 DeepSeek 的只有你说的话和宠物的状态（阶段、饿不饿、菌落大小），不含吃过的文件名。")
+        note.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        box = QVBoxLayout(self)
+        box.addLayout(form)
+        box.addWidget(note)
+        box.addWidget(buttons)
+        self.setStyleSheet(f"QDialog {{ background:{PAPER.name()}; }} QLabel, QCheckBox {{ color:{INK.name()}; }}"
+                           f" QLineEdit, QComboBox {{ background:white; color:{INK.name()}; border:2px solid {INK.name()}; padding:3px; }}")
+        self.resize(460, 0)
+
+    def accept(self):
+        self.colony.save_chat_cfg({"api_key": self.key.text().strip(), "base_url": self.base.text().strip() or CHAT_BASE_URL,
+                                   "model": self.model.currentText().strip() or CHAT_MODELS[0],
+                                   "thinking": self.thinking.isChecked()})
+        super().accept()
+
+
 # ───────────────────────────── 菌落（存档、生长、繁殖） ─────────────────────────────
 
 class Colony:
@@ -1551,6 +1782,13 @@ class Colony:
         self.offline_delta: dict[str, float] = {}
         self.hidden_for_fullscreen = False
         self.views_stale = False
+        self.chat_path = data_dir / "chat.json"
+        self.chat_cfg = self.load_chat_cfg()
+        self.chat_history: dict[str, list[dict]] = {}
+        self.chat_pending: set[str] = set()
+        self.bubbles: dict[str, SpeechBubble] = {}
+        self.chat_bridge = ChatBridge()
+        self.chat_bridge.done.connect(self.on_chat_reply)
         self.watched_screen = None
         self.screen_debounce = QTimer()
         self.screen_debounce.setSingleShot(True)
@@ -1741,6 +1979,101 @@ class Colony:
                 self.build_mat_views()
             for w in self.widgets.values():
                 w.raise_()
+
+    # ── 聊天 ──
+    def load_chat_cfg(self) -> dict:
+        cfg = {}
+        try:
+            cfg = json.loads(self.chat_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            pass
+        if not cfg.get("api_key") and os.environ.get("DEEPSEEK_API_KEY"):
+            cfg = dict(cfg, api_key=os.environ["DEEPSEEK_API_KEY"], from_env=True)
+        return cfg
+
+    def save_chat_cfg(self, cfg: dict):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.chat_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in cfg.items() if k != "from_env"}, f, ensure_ascii=False, indent=1)
+        os.chmod(self.chat_path, 0o600)
+        self.chat_cfg = self.load_chat_cfg()
+
+    def chat_ready(self) -> bool:
+        return bool(self.chat_cfg.get("api_key"))
+
+    def chat_settings(self):
+        ChatSettings(self).exec()
+
+    def open_chat(self, widget: CreatureWidget):
+        if not self.chat_ready():
+            self.chat_settings()
+            if not self.chat_ready():
+                return
+        box = ChatInput(self, widget)
+        box.popup()
+        return box
+
+    def persona(self, c: Creature) -> str:
+        stage = {"spores": "刚冒出来的 3×3 小黑孢子，还不太会说话", "sprout": "刚长出菌盖的小芽",
+                 "baby": "圆滚滚的幼年小蘑菇", "young": "长出了小手小脚的少年蘑菇", "adult": "成年蘑菇，会放孢子"}[c.stage_name]
+        mood = {"full": "吃得饱饱的", "hungry": "有点饿", "starving": "饿扁了，很虚弱", "dormant": "在休眠"}[c.mood]
+        extra = "屏幕边上还长着一只会喷孢子的喷孢菌。" if self.spitter else ""
+        return (f"你是电脑桌面上的一只黑白像素风真菌宠物，名叫 {c.name}，现在是{stage}，{mood}。"
+                f"你靠吃电脑里的 .txt 和 .md 文件长大，已经被喂过 {c.feeds} 次，出生 {fmt_age(time.time() - c.born)}。"
+                f"菌落里一共 {len(self.creatures)} 只菌，屏幕边缘的菌毯铺了 {self.mat.coverage() * 100:.0f}%。{extra}"
+                "用中文回答，语气像一只好奇、有点呆的小蘑菇，符合你现在的状态。"
+                "只回复一句话，不超过 30 个字，不换行，不用表情符号，不要说自己是 AI。"
+                f"现在是 {time.strftime('%H:%M')}。")
+
+    def send_chat(self, widget: CreatureWidget, text: str):
+        c, text = widget.c, " ".join(text.split())[:200]
+        if not text or c.id in self.chat_pending:
+            return
+        widget.touch()
+        if c.mood == "dormant":
+            self.show_bubble(widget, "（休眠中……喂点东西才会醒）", error=True)
+            return
+        history = self.chat_history.setdefault(c.id, [])
+        messages = [{"role": "system", "content": self.persona(c)}] + history[-2 * CHAT_HISTORY:] + [{"role": "user", "content": text}]
+        self.chat_pending.add(c.id)
+        widget.thinking, widget.think_at = True, 0.0
+        widget.update_mask()
+        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg)), daemon=True).start()
+
+    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict):
+        try:
+            reply, err = one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), ""
+        except ChatError as e:
+            reply, err = "", str(e)
+        self.chat_bridge.done.emit(cid, text, reply, err)
+
+    def on_chat_reply(self, cid: str, text: str, reply: str, err: str):
+        self.chat_pending.discard(cid)
+        w = self.widgets.get(cid)
+        if w is None:
+            return
+        w.thinking = False
+        w.floaters = [f for f in w.floaters if f["text"] != "…"]
+        if err:
+            self.show_bubble(w, f"（{err}）", error=True)
+            return
+        history = self.chat_history.setdefault(cid, [])
+        history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+        del history[:-2 * CHAT_HISTORY]
+        self.show_bubble(w, reply)
+        if w.c.mood == "full":
+            w.play("hop")
+
+    def show_bubble(self, widget: CreatureWidget, text: str, error: bool = False) -> SpeechBubble:
+        old = self.bubbles.pop(widget.c.id, None)
+        if old and not old.done:
+            old.finish()
+        bubble = SpeechBubble(widget, text, error)
+        self.bubbles[widget.c.id] = bubble
+        if not self.hidden_for_fullscreen:
+            bubble.show()
+        return bubble
 
     # ── 饥饿 ──
     def metabolize(self, c: Creature, seconds: float):
@@ -2200,6 +2533,7 @@ class Colony:
         info(f"FULL   {'█' * full}{'░' * (10 - full)} {int(c.satiety)}%  {MOOD_NAMES[c.mood]}")
         info(f"FEEDS  {c.feeds}   SPORES {c.released}")
         m.addSeparator()
+        m.addAction("聊天…（双击也行）", lambda: self.open_chat(widget))
         log_menu = m.addMenu("最近吃的")
         log_menu.setStyleSheet(MENU_QSS)
         for ts, label, value in reversed(c.log[-8:]):
@@ -2219,6 +2553,7 @@ class Colony:
         top.toggled.connect(self.set_on_top)
         m.addAction("叫大家回来", self.gather)
         self.mat_menu(m)
+        m.addAction("聊天设置…" + ("" if self.chat_ready() else "（未设置）"), self.chat_settings)
         if len(self.creatures) > 1:
             m.addAction(f"放生 {c.name}…", lambda: self.release(widget))
         m.addSeparator()
@@ -2286,6 +2621,7 @@ class Colony:
         m.setStyleSheet(MENU_QSS)
         m.addAction("叫大家回来", self.gather)
         self.mat_menu(m)
+        m.addAction("聊天设置…", self.chat_settings)
         m.addAction(f"存档位置：{self.save_path}").setEnabled(False)
         m.addAction("重新开始…", self.reset)
         m.addSeparator()

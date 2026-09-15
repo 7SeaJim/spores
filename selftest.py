@@ -53,6 +53,8 @@ def shutdown(colony):
     colony.screen_debounce.stop()
     for s in colony.shots:
         s.finish()
+    for b in colony.bubbles.values():
+        b.finish()
     for v in list(colony.mat_views.values()) + list(colony.patch_views.values()) + [colony.spitter_view]:
         if v:
             v.close()
@@ -673,6 +675,141 @@ check("全屏检测接到隐藏", colony14.hidden_for_fullscreen)
 check("非 Windows 上不检测全屏", F.foreground_fullscreen() is False and not colony14.fullscreen_timer.isActive())
 shutdown(colony14)
 
+print("15. 聊天（DeepSeek）")
+import http.server
+import socket
+import stat
+import threading as _threading
+
+seen = []
+
+
+class FakeDeepSeek(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        seen.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
+        key = self.headers.get("Authorization", "").split()[-1]
+        if key in ("bad", "poor"):
+            self.send_response({"bad": 401, "poor": 402}[key])
+            self.end_headers()
+            return
+        if key == "slow":
+            time.sleep(1.5)
+        reply = {"choices": [{"message": {"role": "assistant", "content": "今天的 notes.md 好好吃！我还想再来一份。明天见。"},
+                              "finish_reason": "stop"}]}
+        data = json.dumps(reply, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except BrokenPipeError:                      # 客户端已超时放弃
+            pass
+
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeDeepSeek)
+_threading.Thread(target=server.serve_forever, daemon=True).start()
+fake_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+check("截成一句话", F.one_sentence("你好呀！今天吃什么？") == "你好呀！" and F.one_sentence("I am 3.5 days old. Hi.") == "I am 3.5 days old."
+      and F.one_sentence("嗯" * 80).endswith("…") and len(F.one_sentence("嗯" * 80)) == F.CHAT_MAX_CHARS and F.one_sentence("") == "……")
+
+os.environ.pop("DEEPSEEK_API_KEY", None)
+colony15 = F.Colony(root / "save15")
+c15 = colony15.creatures[0]
+w15 = colony15.widgets[c15.id]
+check("没填 Key 时聊天未就绪", not colony15.chat_ready())
+colony15.save_chat_cfg({"api_key": "good", "base_url": fake_url, "model": "deepseek-flash", "thinking": False})
+check("Key 保存为仅本人可读（600）", stat.S_IMODE(os.stat(colony15.chat_path).st_mode) == 0o600 and colony15.chat_ready())
+c15.log = [[int(time.time()), "私密日记.md", 10]]
+colony15.send_chat(w15, "  你今天 吃了什么？ ")
+w15.idle(time.time())
+check("等回复时头上冒 …", w15.thinking and any(f["text"] == "…" for f in w15.floaters))
+wait(1.5)
+req = seen[-1]
+check("请求 DeepSeek /chat/completions，带 Bearer Key 和模型名", req["path"] == "/chat/completions" and req["auth"] == "Bearer good"
+      and req["body"]["model"] == "deepseek-flash" and req["body"]["messages"][-1] == {"role": "user", "content": "你今天 吃了什么？"})
+sys_prompt = req["body"]["messages"][0]["content"]
+check("人设带宠物状态、要求一句话，不含吃过的文件名", req["body"]["messages"][0]["role"] == "system" and c15.name in sys_prompt
+      and "一句话" in sys_prompt and "私密日记" not in sys_prompt)
+bubble = colony15.bubbles.get(c15.id)
+check("回复只留一句话，显示在头顶气泡里", bubble and bubble.text == "今天的 notes.md 好好吃！" and bubble.isVisible() and not w15.thinking)
+check("气泡在宠物正上方", abs(bubble.geometry().center().x() - (w15.x() + w15.sprite_rect.center().x())) <= 2
+      and bubble.geometry().bottom() <= w15.y() + w15.sprite_rect.y() + 2)
+bubble_grab = (bubble.grab(), w15.grab())
+colony15.send_chat(w15, "还饿吗")
+wait(1.2)
+msgs = seen[-1]["body"]["messages"]
+check("记得上一轮对话", [m["role"] for m in msgs] == ["system", "user", "assistant", "user"] and msgs[2]["content"] == "今天的 notes.md 好好吃！")
+check("非思考模式：DeepSeek 关掉思考、限制长度", seen[-1]["body"]["max_tokens"] == 120 and "thinking" not in seen[-1]["body"])
+colony15.chat_cfg["base_url"] = "https://api.deepseek.com"
+body_probe = {}
+real_urlopen = F.urllib.request.urlopen
+
+
+def probe(req, timeout=None):
+    body_probe.update(json.loads(req.data))
+    raise F.urllib.error.URLError("probe")
+
+
+F.urllib.request.urlopen = probe
+try:
+    F.chat_request(colony15.chat_cfg, [{"role": "user", "content": "hi"}])
+except F.ChatError:
+    pass
+F.urllib.request.urlopen = real_urlopen
+check("官方地址时传 thinking disabled（DeepSeek 默认开思考）", body_probe.get("thinking") == {"type": "disabled"})
+colony15.chat_cfg["base_url"] = fake_url
+for key, expect in (("bad", "API Key 不对"), ("poor", "余额不足")):
+    colony15.chat_cfg["api_key"] = key
+    colony15.send_chat(w15, "喂")
+    wait(1.0)
+    b = colony15.bubbles[c15.id]
+    check(f"HTTP 错误显示原因：{expect}", expect in b.text and b.error)
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    dead_port = sock.getsockname()[1]
+colony15.chat_cfg.update(api_key="good", base_url=f"http://127.0.0.1:{dead_port}")
+colony15.send_chat(w15, "在吗")
+wait(1.0)
+check("连不上时气泡说连不上", "连不上" in colony15.bubbles[c15.id].text)
+colony15.chat_cfg.update(api_key="slow", base_url=fake_url, timeout=0.5)
+colony15.send_chat(w15, "慢慢说")
+wait(1.3)
+check("超时也不卡界面，显示连不上", "连不上" in colony15.bubbles[c15.id].text and not w15.thinking)
+colony15.chat_cfg.pop("timeout")
+colony15.chat_cfg["api_key"] = "good"
+wait(1.0)
+n_req = len(seen)
+c15.satiety, c15.nutrition = 0, 0
+colony15.send_chat(w15, "醒醒")
+wait(0.8)
+check("休眠孢子不发请求", len(seen) == n_req and "休眠" in colony15.bubbles[c15.id].text)
+c15.satiety, c15.nutrition = 60, 10
+long_text = "这是一句很长很长的话" * 4
+lb = colony15.show_bubble(w15, long_text)
+check("长文本在气泡里换行（宽度有上限）", lb.width() <= F.SpeechBubble.MAX_W + 2 * F.SpeechBubble.PAD + 2 and lb.height() > 60)
+w15.c.x += 120
+w15.place()
+wait(0.2)
+check("气泡跟着宠物走", abs(lb.geometry().center().x() - (w15.x() + w15.sprite_rect.center().x())) <= 2)
+lb.t0 -= lb.dur + 1
+wait(0.2)
+check("到时间气泡消失", lb.done and not lb.isVisible())
+colony15.set_fullscreen_hidden(True)
+check("全屏隐藏时气泡不冒出来", not colony15.show_bubble(w15, "嘘").isVisible())
+colony15.set_fullscreen_hidden(False)
+os.environ["DEEPSEEK_API_KEY"] = "from-env"
+colony15.chat_path.unlink()
+check("没保存 Key 时读环境变量 DEEPSEEK_API_KEY", colony15.load_chat_cfg().get("api_key") == "from-env")
+os.environ.pop("DEEPSEEK_API_KEY")
+server.shutdown()
+shutdown(colony15)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
@@ -693,6 +830,14 @@ out_dir.mkdir(parents=True, exist_ok=True)
 img.save(str(out_dir / "widgets.png"))
 iimg.save(str(out_dir / "idle.png"))
 mat_light.save(str(out_dir / "mat_light.png"))
+bimg = QImage(max(bubble_grab[0].width(), bubble_grab[1].width()) + 40, bubble_grab[0].height() + bubble_grab[1].height() + 20,
+              QImage.Format.Format_ARGB32)
+bimg.fill(QColor(38, 56, 74))
+bp = QPainter(bimg)
+bp.drawPixmap((bimg.width() - bubble_grab[0].width()) // 2, 6, bubble_grab[0])
+bp.drawPixmap((bimg.width() - bubble_grab[1].width()) // 2, bubble_grab[0].height() - F.TEXT_BAND + 6, bubble_grab[1])
+bp.end()
+bimg.save(str(out_dir / "chat_bubble.png"))
 mat_dark.save(str(out_dir / "mat_dark.png"))
 screen9.save(str(out_dir / "spitter_light.png"))
 screen9_dark.save(str(out_dir / "spitter_dark.png"))
