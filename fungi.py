@@ -10,14 +10,14 @@ FUNGI.EXE — 桌面真菌宠物（最小闭环 demo）
     python3 fungi.py --data-dir DIR  使用单独的存档目录
 
 操作:
-    拖文件 / 文件夹到它身上 = 喂食（只读取文件大小和数量，文件本身不会被改动）
+    拖文件 / 文件夹到它身上 = 喂食：能吃的 .txt / .md 会被真的吃掉（Linux 等直接删除，Windows 移到回收站），
+                                  吃掉的完整路径记在存档目录的 eaten.log；右键可关掉「吞噬文件」
     左键拖动 = 搬家    单击 = 戳一下    右键 = 状态和菜单
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
 import hashlib
 import json
 import math
@@ -29,6 +29,11 @@ import time
 from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:                      # Windows
+    fcntl = None
 
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
@@ -68,6 +73,10 @@ IDLE_RIG = {               # 阶段: (菌盖行数, 呼吸时抽掉的菌柄行)
 BREATH_PERIOD = 3.2        # 呼吸周期（秒），睡着时 ×1.6
 IDLE_GAP = (6, 16)         # 两个待机小动作之间隔几秒
 SLEEP_AFTER = 600          # 多少秒没人理就睡着；深夜 0–7 点缩短到 1/5
+HUNGRY_IDLE = {            # 饿的时候：不蹦跶，嘟囔
+    "hungry": [("grumble", 2), ("blink2", 2), ("tilt", 1)],
+    "starving": [("grumble", 3), ("blink2", 1)],
+}
 IDLE_WEIGHTS = {           # 阶段: [(动作, 权重)]
     0: [("wiggle", 3), ("hop", 1)],
     1: [("tilt", 2), ("hop", 2), ("blink2", 2)],
@@ -95,6 +104,19 @@ PATCH_MAX = (3, 7)         # 桌面中间的菌斑最多长到多大半径（格
 PATCH_GROW = 0.04          # 菌斑每次（MAT_TICK）长多少格半径
 MAX_PATCHES = 30
 OUTCOME_NAMES = {"vanish": "消失", "mat": "菌毯", "spore": "孢子"}
+
+# 饥饿：不喂食的话会饿，饿扁了会缩回去，最后变成休眠孢子（喂一次就醒）
+SATIETY_MAX = 100
+HUNGER_HOURS = 16          # 从吃饱到饿扁要多少小时
+HUNGRY_AT = 30             # 饱腹低于这个就是「饿」：生长减半，会嘟囔
+SATIETY_PER_FOOD = 4       # 每 1 营养加多少饱腹
+STARVE_LOSS = 6            # 饿扁（饱腹 0）后每小时掉多少营养
+OFFLINE_STARVE_CAP = 36    # 关闭程序期间最多饿掉多少营养
+MAT_RECEDE = 0.3           # 全体饿扁时，边缘菌毯每次（MAT_TICK）退缩几步
+MOOD_NAMES = {"full": "", "hungry": "饿", "starving": "饿扁了", "dormant": "休眠"}
+
+DEVOUR = True              # 默认吞噬文件（右键菜单可关）
+PROJECT_DIR = Path(__file__).resolve().parent
 
 EDIBLE_EXT = {".txt", ".md"}
 MAX_ITEMS_PER_DROP = 5
@@ -255,6 +277,16 @@ def spore_size(nutrition: float) -> int:
     return min(5, 3 + int(3 * nutrition / STAGES[1][1]))
 
 
+def withered(colors: dict[str, QColor]) -> dict[str, QColor]:
+    """饿扁了：白的发灰、黑的褪成灰褐"""
+    out = {}
+    for ch, c in colors.items():
+        light = c.lightness()
+        out[ch] = (QColor(196, 191, 178) if light > 200 else QColor(150, 146, 136) if light > 150
+                   else QColor(78, 74, 67) if light < 60 else QColor(110, 106, 98))
+    return out
+
+
 def paint_rows(rows: list[str], colors: dict[str, QColor]) -> QImage:
     img = QImage(len(rows[0]) * PX, len(rows) * PX, QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(Qt.GlobalColor.transparent)
@@ -269,11 +301,14 @@ def paint_rows(rows: list[str], colors: dict[str, QColor]) -> QImage:
 
 @lru_cache(maxsize=512)
 def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = False,
-               invert: bool = False, breath: bool = False, tilt: int = 0) -> QPixmap:
+               invert: bool = False, breath: bool = False, tilt: int = 0, wither: bool = False,
+               mood: str = "full") -> QPixmap:
     art, colors = None, {"#": INK, "o": PAPER}
     if stage > 0:
         name = STAGES[stage][0]
-        drawn = load_pxl(name + ("_eat" if mouth else "_blink" if blink else "")) or load_pxl(name)
+        frame = ("_eat" if mouth else "_starving" if mood == "starving" else "_blink" if blink
+                 else "_hungry" if mood == "hungry" else "")
+        drawn = load_pxl(name + frame) or load_pxl(name)
         if drawn:
             art, colors = list(drawn[0]), {ch: QColor(hexc) for ch, hexc in drawn[1]}
             rig = IDLE_RIG[stage]
@@ -284,6 +319,8 @@ def art_pixmap(stage: int, size: int = 3, blink: bool = False, mouth: bool = Fal
     if stage > 0:
         art = pose(art, rig[0], rig[1], breath, tilt)
     art = add_halo(art)
+    if wither:
+        colors = withered(colors)
     if invert:
         colors = {ch: QColor(255 - c.red(), 255 - c.green(), 255 - c.blue()) for ch, c in colors.items()}
     halo = QColor(INK if invert else PAPER)
@@ -303,6 +340,7 @@ class Creature:
     nutrition: float = 0.0
     feeds: int = 0
     released: int = 0                                   # 已放出的 spores 数
+    satiety: float = 60.0                               # 饱腹 0–100
     x: int = 0                                          # 脚底中心的屏幕坐标
     y: int = 0
     eaten: list[str] = field(default_factory=list)      # 吃过的食物指纹（不保存路径）
@@ -320,6 +358,18 @@ class Creature:
     @property
     def stage_name(self) -> str:
         return STAGES[self.stage][0]
+
+    @property
+    def mood(self) -> str:
+        if self.satiety > HUNGRY_AT:
+            return "full"
+        if self.satiety > 0:
+            return "hungry"
+        return "dormant" if self.nutrition <= 0 else "starving"
+
+    @property
+    def growth_factor(self) -> float:
+        return {"full": 1.0, "hungry": 0.5}.get(self.mood, 0.0)
 
     def next_goal(self) -> int:
         if self.stage < ADULT:
@@ -343,10 +393,13 @@ class Food:
     value: int
     key: str
     note: str = ""
+    targets: list[Path] = field(default_factory=list)   # 吞噬时要吃掉的文件
+    dirs: list[Path] = field(default_factory=list)      # 吃完后尝试清掉的空目录（深的在前）
 
 
-def count_edible(root: Path, max_depth: int = 3, budget: int = 3000) -> int:
-    n, stack = 0, [(root, 0)]
+def find_edible(root: Path, max_depth: int = 3, budget: int = 3000) -> tuple[list[Path], list[Path]]:
+    """文件夹里能吃的 txt/md，以及走过的子目录。跳过隐藏项，不跟随目录链接。"""
+    files, dirs, stack = [], [], [(root, 0)]
     while stack and budget > 0:
         d, depth = stack.pop()
         try:
@@ -360,33 +413,97 @@ def count_edible(root: Path, max_depth: int = 3, budget: int = 3000) -> int:
                     try:
                         if e.is_dir(follow_symlinks=False):
                             if depth < max_depth:
+                                dirs.append(Path(e.path))
                                 stack.append((Path(e.path), depth + 1))
                         elif os.path.splitext(e.name)[1].lower() in EDIBLE_EXT:
-                            n += 1
+                            files.append(Path(e.path))
                     except OSError:
                         pass
         except OSError:
             pass
-    return n
+    return files, sorted(dirs, key=lambda p: len(p.parts), reverse=True) + [root]
+
+
+def count_edible(root: Path, max_depth: int = 3, budget: int = 3000) -> int:
+    return len(find_edible(root, max_depth, budget)[0])
 
 
 def digest(path: Path) -> tuple[Food | None, str]:
-    """把一个路径变成食物。只看 stat 和目录结构，不读取、不修改文件内容。"""
+    """把一个路径变成食物。只看 stat 和目录结构，不读文件内容；真正吃掉（删除）由 Colony.devour 做。"""
     try:
         st = path.stat()
     except OSError:
         return None, "够不着…"
     key = hashlib.sha1(f"{os.path.realpath(path)}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:16]
     if path.is_dir():
-        n = count_edible(path)
-        if n == 0:
-            return Food(path.name + "/", 3, key, "空空的"), ""
-        return Food(path.name + "/", min(30, 6 + 2 * n), key), ""
+        files, dirs = find_edible(path)
+        if not files:
+            return Food(path.name + "/", 3, key, "空空的", [], dirs), ""
+        return Food(path.name + "/", min(30, 6 + 2 * len(files)), key, "", files, dirs), ""
     if path.suffix.lower() in EDIBLE_EXT:
         if st.st_size == 0:
-            return Food(path.name, 2, key, "空的…"), ""
-        return Food(path.name, min(20, 4 + int(3 * math.log2(st.st_size / 256 + 1))), key), ""
+            return Food(path.name, 2, key, "空的…", [path]), ""
+        return Food(path.name, min(20, 4 + int(3 * math.log2(st.st_size / 256 + 1))), key, "", [path]), ""
     return None, f"不吃 {path.suffix or path.name}"
+
+
+def devour_file(path: Path) -> None:
+    """吃掉一个文件：Windows 移到回收站，其他系统直接删除。失败抛 OSError。"""
+    if sys.platform != "win32":
+        path.unlink()
+        return
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        send2trash = None
+    if send2trash:
+        try:
+            send2trash(str(path))
+        except Exception as err:          # send2trash 的异常不一定是 OSError
+            raise OSError(str(err)) from err
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    op = SHFILEOPSTRUCTW(None, FO_DELETE, str(path.resolve()) + "\0", None,
+                         FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI, False, None, None)
+    if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) or op.fAnyOperationsAborted:
+        raise OSError(f"没能移到回收站：{path}")
+
+
+def foreground_fullscreen() -> bool:
+    """Windows：前台是不是别的程序的全屏窗口（看视频、打游戏）。其他系统返回 False。"""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):   # 桌面、任务栏不算
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+    rect, info = wintypes.RECT(), MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)) or \
+            not user32.GetMonitorInfoW(user32.MonitorFromWindow(hwnd, 2), ctypes.byref(info)):
+        return False
+    m = info.rcMonitor
+    return rect.left <= m.left and rect.top <= m.top and rect.right >= m.right and rect.bottom >= m.bottom
 
 
 def fmt_age(sec: float) -> str:
@@ -399,7 +516,8 @@ def fmt_age(sec: float) -> str:
 
 def ui_font(px: int = 12, bold: bool = True) -> QFont:
     f = QFont()
-    f.setFamilies(["DejaVu Sans Mono", "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "monospace"])
+    f.setFamilies(["DejaVu Sans Mono", "Consolas", "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "Microsoft YaHei UI",
+                   "Microsoft YaHei", "monospace"])
     f.setPixelSize(px)
     f.setBold(bold)
     return f
@@ -419,7 +537,7 @@ def draw_label(p: QPainter, text: str, cx: float, baseline: float, font: QFont, 
 
 MENU_QSS = f"""
 QMenu {{ background:{PAPER.name()}; color:{INK.name()}; border:2px solid {INK.name()}; padding:4px;
-         font-family:'DejaVu Sans Mono','Noto Sans CJK SC',monospace; font-size:12px; font-weight:bold; }}
+         font-family:'DejaVu Sans Mono','Consolas','Noto Sans CJK SC','Microsoft YaHei UI',monospace; font-size:12px; font-weight:bold; }}
 QMenu::item {{ padding:4px 22px 4px 12px; }}
 QMenu::item:selected {{ background:{INK.name()}; color:{PAPER.name()}; }}
 QMenu::item:disabled {{ color:{INK.name()}; }}
@@ -467,6 +585,7 @@ class CreatureWidget(QWidget):
         self.asleep = False
         self.z_at = 0.0
         self.z_n = 0
+        self.shown_mood = creature.mood
         self._key = None
         self.sprite_rect = QRect()
 
@@ -562,6 +681,9 @@ class CreatureWidget(QWidget):
         return (now + self.phase) % period > period * 0.55
 
     def idle(self, now: float):
+        if self.c.mood == "dormant":                    # 休眠孢子：一动不动，等人喂
+            self.asleep = False
+            return
         busy = self.anim or self.press or self.flight or self.drag_over or self.hover
         if not self.asleep and not busy and now - self.last_touch > self.colony.sleep_after():
             self.asleep = True
@@ -575,7 +697,7 @@ class CreatureWidget(QWidget):
         if busy or now < self.idle_at:
             return
         self.idle_at = now + random.uniform(*IDLE_GAP)
-        acts = IDLE_WEIGHTS[self.c.stage]
+        acts = HUNGRY_IDLE.get(self.c.mood, IDLE_WEIGHTS[self.c.stage])
         self.do_idle(random.choices([a for a, _ in acts], [w for _, w in acts])[0])
 
     def do_idle(self, act: str):
@@ -584,6 +706,9 @@ class CreatureWidget(QWidget):
             self.blinks = [now, now + 0.3]
         elif act == "puff":
             self.puff()
+        elif act == "grumble":
+            self.say(random.choice(["饿…", "咕…", "……", "想吃 .txt"]) if self.c.mood == "hungry"
+                     else random.choice(["好饿……", "咕噜……", "……"]))
         else:
             self.play(act)
 
@@ -614,14 +739,15 @@ class CreatureWidget(QWidget):
         anim = self.anim[0] if self.anim else None
         t = now - self.anim[1] if self.anim else 0
         invert = anim == "grow" and int(t / 0.15) % 2 == 0
+        wither = c.mood in ("starving", "dormant")
         if c.stage == 0:
-            return art_pixmap(0, spore_size(c.nutrition), invert=invert)
+            return art_pixmap(0, spore_size(c.nutrition), invert=invert, wither=wither)
         mouth = self.drag_over or (anim == "eat" and int(t * 8) % 2 == 0)
         blink = self.asleep or any(b <= now < b + 0.15 for b in self.blinks)
         calm = not (mouth or anim in LOUD_ANIMS or self.flight or self.press)
         breath = calm and self.breathing_out(now)
         tilt = TILT_STEPS[min(len(TILT_STEPS) - 1, int(t / ANIM_DUR["tilt"] * len(TILT_STEPS)))] if anim == "tilt" else 0
-        return art_pixmap(c.stage, 3, blink, mouth, invert, breath, tilt)
+        return art_pixmap(c.stage, 3, blink, mouth, invert, breath, tilt, wither, c.mood)
 
     def tick(self):
         now = time.time()
@@ -646,6 +772,12 @@ class CreatureWidget(QWidget):
         self.idle(now)
         if self.c.stage != self.shown_stage:
             self.refit()
+        mood = self.c.mood
+        if mood != self.shown_mood:
+            order = list(MOOD_NAMES)
+            if order.index(mood) > order.index(self.shown_mood):
+                self.say({"hungry": "饿了…", "starving": "好饿……", "dormant": "（休眠了）"}[mood])
+            self.shown_mood = mood
         self.update_mask()
 
         loud = self.flight or any(not f["ambient"] for f in self.floaters) or any(q["kind"] == "crumb" for q in self.particles)
@@ -703,7 +835,8 @@ class CreatureWidget(QWidget):
 
         if self.hover and not active and not self.drag_over:
             c = self.c
-            draw_label(p, f"{c.name} · {c.stage_name}", self.width() / 2, top - 16, ui_font(12))
+            mood = {"dormant": "休眠 · 喂点东西吧"}.get(c.mood, MOOD_NAMES[c.mood])
+            draw_label(p, f"{c.name} · {c.stage_name}" + (f" · {mood}" if mood else ""), self.width() / 2, top - 16, ui_font(12))
             lo, hi = c.stage_floor(), c.next_goal()
             frac = max(0.0, min(1.0, (c.nutrition - lo) / (hi - lo)))
             bw, bh = 64, 8
@@ -921,6 +1054,24 @@ class Mycelium:
             elif rng.random() < 1 - d[i] / MAT_MAX:
                 self.bump(i)
 
+    def shrink(self, steps: int, rng=random):
+        """菌毯退缩：优先从比邻格厚的地方（前沿、凸起）往回收"""
+        d, n = self.d, self.n
+        for _ in range(steps):
+            if not self.active:
+                return
+            k = rng.randrange(len(self.active))
+            i = self.active[k]
+            if min(d[(i - 1) % n], d[(i + 1) % n]) >= d[i] and rng.random() > 0.2:
+                continue
+            d[i] -= 1
+            if not d[i]:
+                self.active[k] = self.active[-1]
+                self.active.pop()
+            self.dirty.update(j % n for j in range(i - 11, i + 12))
+            self._eff.clear()
+            self._sprout.clear()
+
     def coverage(self) -> float:
         return sum(self.d) / (self.n * MAT_MAX)
 
@@ -1118,7 +1269,7 @@ EDGE_POSE = {"bottom": ((0, -1), 0), "top": ((0, 1), 180), "left": ((1, 0), 90),
 
 
 @lru_cache(maxsize=64)
-def spitter_image(frame: str, rotation: int = 0, reveal: int = 99) -> QImage:
+def spitter_image(frame: str, rotation: int = 0, reveal: int = 99, wither: bool = False) -> QImage:
     """喷孢菌的一帧（idle / blink / charge / shoot），reveal = 从根部往上露出几行"""
     drawn = load_pxl("spitter" if frame == "idle" else f"spitter_{frame}") or load_pxl("spitter")
     if drawn:
@@ -1127,6 +1278,8 @@ def spitter_image(frame: str, rotation: int = 0, reveal: int = 99) -> QImage:
         rows, colors = ["..###..", ".#ooo#.", "#ooooo#", "#o#o#o#", "#ooooo#", ".#####."], {"#": INK, "o": PAPER}
     if reveal < len(rows):
         rows = ["." * len(rows[0])] * (len(rows) - reveal) + rows[len(rows) - reveal:]
+    if wither:
+        colors = withered(colors)
     halo = QColor(PAPER)
     halo.setAlpha(235)
     colors[HALO] = halo
@@ -1153,16 +1306,17 @@ class SpitterWidget(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start(50)
 
-    def pose(self, now: float) -> tuple[str, int, int, tuple[int, int]]:
+    def pose(self, now: float) -> tuple[str, int, int, tuple[int, int], bool]:
         sp, m = self.colony.spitter, self.colony.mat
         edge = m.edge_of(sp["i"])[0]
         (ux, uy), rot = EDGE_POSE[edge]
         age = now - sp["born"]
         reveal = int(22 * age / 2.5) if age < 2.5 else 99
         shake = (0, 0)
+        starving = self.colony.starving()
         if now - sp.get("shot_at", 0) < 0.35:
             frame = "shoot"
-        elif sp["next_at"] - now < 0.8:
+        elif sp["next_at"] - now < 0.8 and not starving:
             frame = "charge"
             j = 2 if int(now * 20) % 2 else -2
             shake = (abs(uy) * j, abs(ux) * j)          # 沿着边抖
@@ -1170,7 +1324,7 @@ class SpitterWidget(QWidget):
             frame = "blink"
         else:
             frame = "idle"
-        return frame, rot, reveal, shake
+        return frame, rot, reveal, shake, starving
 
     def place(self):
         c, m, sp = self.colony, self.colony.mat, self.colony.spitter
@@ -1191,9 +1345,9 @@ class SpitterWidget(QWidget):
             self.update()
 
     def paintEvent(self, _):
-        frame, rot, reveal, (dx, dy) = self.pose(time.time())
+        frame, rot, reveal, (dx, dy), starving = self.pose(time.time())
         p = QPainter(self)
-        p.drawImage(self.MARGIN + dx, self.MARGIN + dy, spitter_image(frame, rot, reveal))
+        p.drawImage(self.MARGIN + dx, self.MARGIN + dy, spitter_image(frame, rot, reveal, starving))
         p.end()
 
     def mousePressEvent(self, e):
@@ -1387,6 +1541,15 @@ class Colony:
         self.patches: list[Patch] = []
         self.patch_views: dict[int, PatchView] = {}
         self.shots: list[SporeShot] = []
+        self.devour = DEVOUR
+        self.protected_dirs = [PROJECT_DIR, data_dir.resolve()]
+        self.offline_delta: dict[str, float] = {}
+        self.hidden_for_fullscreen = False
+        self.views_stale = False
+        self.watched_screen = None
+        self.screen_debounce = QTimer()
+        self.screen_debounce.setSingleShot(True)
+        self.screen_debounce.timeout.connect(self.on_screen_changed)
 
         offline = self.load()
         self.grow_mat_offline(self.offline_elapsed)
@@ -1395,8 +1558,11 @@ class Colony:
             self.spawn_widget(c)
         for c in list(self.creatures):
             self.after_growth(self.widgets[c.id], c.stage, quiet=True)
-            if offline >= 1:
-                self.widgets[c.id].say(f"+{int(offline)} 睡觉时长的", delay=0.6)
+            delta = self.offline_delta.get(c.id, 0.0)
+            if delta >= 1:
+                self.widgets[c.id].say(f"+{int(delta)} 睡觉时长的", delay=0.6)
+            elif delta <= -1:
+                self.widgets[c.id].say(f"{int(delta)} 饿瘦了", delay=0.6)
         self.save()
 
         self.tick_timer = QTimer()
@@ -1408,6 +1574,14 @@ class Colony:
         self.spitter_timer = QTimer()
         self.spitter_timer.timeout.connect(self.spitter_tick)
         self.spitter_timer.start(100)
+        self.fullscreen_timer = QTimer()
+        self.fullscreen_timer.timeout.connect(self.check_fullscreen)
+        if sys.platform == "win32":
+            self.fullscreen_timer.start(1500)
+        app = QGuiApplication.instance()
+        if app:
+            app.primaryScreenChanged.connect(self.watch_screen)
+        self.watch_screen(QGuiApplication.primaryScreen(), initial=True)
         self.tray = self.make_tray()
 
     def sleep_after(self) -> float:
@@ -1445,6 +1619,7 @@ class Colony:
         if data:
             self.name_i = data.get("name_i", 0)
             self.on_top = data.get("on_top", True)
+            self.devour = data.get("devour", DEVOUR)
             self.mat_layer = data.get("mat_layer", "top")
             saved_mat = Mycelium.from_json(data.get("mat"))
             if saved_mat:
@@ -1461,9 +1636,9 @@ class Colony:
             self.creatures = [Creature.from_dict(d) for d in data.get("creatures", [])]
             elapsed = time.time() - data.get("last_seen", time.time())
             self.offline_elapsed = max(0.0, elapsed)
-            offline = min(OFFLINE_CAP, max(0.0, elapsed) * self.passive_mult / PASSIVE_SECONDS)
             for c in self.creatures:
-                c.nutrition += offline
+                self.offline_delta[c.id] = self.offline_metabolize(c, self.offline_elapsed * self.passive_mult)
+                offline = max(offline, self.offline_delta[c.id])
                 if QGuiApplication.screenAt(QPoint(c.x, c.y - 8)) is None:
                     c.x, c.y = self.default_spot()
         if not self.creatures:
@@ -1472,7 +1647,7 @@ class Colony:
 
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top,
+        data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top, "devour": self.devour,
                 "mat_layer": self.mat_layer, "mat": self.mat.to_json(),
                 "patches": [asdict(p) for p in self.patches],
                 "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats")}
@@ -1487,7 +1662,8 @@ class Colony:
     def spawn_widget(self, c: Creature) -> CreatureWidget:
         w = CreatureWidget(self, c, self.on_top)
         self.widgets[c.id] = w
-        w.show()
+        if not self.hidden_for_fullscreen:
+            w.show()
         return w
 
     def tick(self):
@@ -1496,7 +1672,7 @@ class Colony:
         self.last_tick = now
         for c in list(self.creatures):
             before = c.stage
-            c.nutrition += dt * self.passive_mult / PASSIVE_SECONDS
+            self.metabolize(c, dt * self.passive_mult)
             if c.stage != before or c.spores_due() > 0:
                 self.after_growth(self.widgets[c.id], before)
         self.mat_acc += dt * self.passive_mult
@@ -1505,6 +1681,87 @@ class Colony:
             self.mat_step()
         if self.mat.dirty:
             self.render_mat()
+
+    # ── 屏幕变化（换主屏、改分辨率/缩放、挪任务栏）与全屏 ──
+    def watch_screen(self, screen, initial: bool = False):
+        if self.watched_screen is not None:
+            try:
+                self.watched_screen.availableGeometryChanged.disconnect(self.schedule_screen_change)
+            except (TypeError, RuntimeError):
+                pass
+        self.watched_screen = screen
+        if screen is not None:
+            screen.availableGeometryChanged.connect(self.schedule_screen_change)
+        if not initial:
+            self.schedule_screen_change()
+
+    def schedule_screen_change(self, *_):
+        self.screen_debounce.start(400)                  # 这类信号常常一次来好几个
+
+    def on_screen_changed(self):
+        """按新的桌面可用区域重新铺菌毯；跑到屏幕外的宠物拉回来"""
+        a = self.mat_area()
+        cols, rows = a.width() // PX, a.height() // PX
+        if (cols, rows) != (self.mat.cols, self.mat.rows):
+            self.mat = self.mat.resized(cols, rows)
+            if self.spitter:
+                sp = self.spitter
+                length = self.mat.edge_len(sp["edge"])
+                sp["i"] = self.mat.index_at(sp["edge"], min(length - 1, int(sp["frac"] * length)))
+        for c in self.creatures:
+            if QGuiApplication.screenAt(QPoint(c.x, c.y - 8)) is None:
+                c.x, c.y = self.default_spot()
+                self.widgets[c.id].place()
+        if self.hidden_for_fullscreen:
+            self.views_stale = True                      # 退出全屏再重铺
+        else:
+            self.build_mat_views()
+        self.save()
+
+    def check_fullscreen(self):
+        full = foreground_fullscreen()
+        if full != self.hidden_for_fullscreen:
+            self.set_fullscreen_hidden(full)
+
+    def set_fullscreen_hidden(self, hidden: bool):
+        """前台全屏时把菌毯、菌斑、喷孢菌和宠物都藏起来，退出全屏再出来（期间照样长）"""
+        self.hidden_for_fullscreen = hidden
+        views = list(self.mat_views.values()) + list(self.patch_views.values()) + [self.spitter_view] + list(self.widgets.values())
+        for v in views:
+            if v:
+                v.setVisible(not hidden)
+        if not hidden:
+            if self.views_stale:
+                self.views_stale = False
+                self.build_mat_views()
+            for w in self.widgets.values():
+                w.raise_()
+
+    # ── 饥饿 ──
+    def metabolize(self, c: Creature, seconds: float):
+        """在线的 seconds 秒（已乘速度倍率）：吃饱正常长、饿了长一半、饿扁了掉营养"""
+        hours = seconds / 3600
+        if c.satiety > 0:
+            c.nutrition += seconds / PASSIVE_SECONDS * c.growth_factor
+            c.satiety = max(0.0, c.satiety - hours * SATIETY_MAX / HUNGER_HOURS)
+        else:
+            c.nutrition = max(0.0, c.nutrition - hours * STARVE_LOSS)
+
+    def offline_metabolize(self, c: Creature, seconds: float) -> float:
+        """关闭期间：先吃老本长（有上限），饿扁之后掉营养（有上限）。返回营养变化。"""
+        hours, rate = seconds / 3600, SATIETY_MAX / HUNGER_HOURS
+        fed_h = min(hours, c.satiety / rate)
+        full_h = min(fed_h, max(0.0, (c.satiety - HUNGRY_AT) / rate))
+        grow = min(OFFLINE_CAP, (full_h + (fed_h - full_h) * 0.5) * 3600 / PASSIVE_SECONDS)
+        starve = min(OFFLINE_STARVE_CAP, (hours - fed_h) * STARVE_LOSS)
+        before = c.nutrition
+        c.satiety = max(0.0, c.satiety - hours * rate)
+        c.nutrition = max(0.0, c.nutrition + grow - starve)
+        return c.nutrition - before
+
+    def starving(self) -> bool:
+        """全体都饿扁 / 休眠了"""
+        return bool(self.creatures) and all(c.growth_factor == 0 for c in self.creatures)
 
     # ── 菌毯 ──
     def mat_area(self) -> QRect:
@@ -1518,15 +1775,19 @@ class Colony:
     def mat_step(self):
         vigor = 0.0
         for c in self.creatures:
-            v = MAT_VIGOR[c.stage]
+            v = MAT_VIGOR[c.stage] * c.growth_factor
             vigor += v
             if random.random() < MAT_SEED * v and self.mat.seed(self.mat_index(c)):
                 w = self.widgets.get(c.id)
                 if w and c.stage and not w.asleep:
                     w.puff(2)
-        budget = MAT_RATE * vigor
-        self.mat.grow(int(budget) + (random.random() < budget % 1))
-        self.grow_patches(PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        budget = MAT_RATE * vigor if vigor else MAT_RECEDE
+        steps = int(budget) + (random.random() < budget % 1)
+        if vigor:
+            self.mat.grow(steps)
+            self.grow_patches(PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        else:
+            self.mat.shrink(steps)                        # 全体饿扁：菌毯慢慢退
         self.check_spitter()
         if self.spitter_view:
             self.spitter_view.place()
@@ -1536,11 +1797,14 @@ class Colony:
         if steps < 1:
             return
         for c in self.creatures:
-            if random.random() < 1 - (1 - MAT_SEED * MAT_VIGOR[c.stage]) ** steps:
+            if random.random() < 1 - (1 - MAT_SEED * MAT_VIGOR[c.stage] * c.growth_factor) ** steps:
                 self.mat.seed(self.mat_index(c))
-        vigor = sum(MAT_VIGOR[c.stage] for c in self.creatures)
-        self.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * vigor)))
-        self.grow_patches(steps * PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        vigor = sum(MAT_VIGOR[c.stage] * c.growth_factor for c in self.creatures)
+        if vigor:
+            self.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * vigor)))
+            self.grow_patches(steps * PATCH_GROW * (0.5 + min(vigor, 6) / 6))
+        else:
+            self.mat.shrink(int(min(MAT_OFFLINE_CAP, steps * MAT_RECEDE)))
         self.check_spitter(quiet=True)
 
     def build_mat_views(self):
@@ -1556,13 +1820,13 @@ class Colony:
                      "left": QRect(a.x(), a.y(), t, h), "right": QRect(a.x() + w - t, a.y(), t, h)}
             self.mat_views = {edge: MatStrip(edge, rect, self.mat_layer) for edge, rect in rects.items()}
             self.render_mat(full=True)
-            for v in self.mat_views.values():
-                v.show()
             for p in self.patches:
                 self.add_patch_view(p)
             if self.spitter:
                 self.spitter_view = SpitterWidget(self, self.mat_layer)
-                self.spitter_view.show()
+            for v in list(self.mat_views.values()) + [self.spitter_view]:
+                if v and not self.hidden_for_fullscreen:
+                    v.show()
         for w in self.widgets.values():
             w.raise_()
 
@@ -1572,7 +1836,8 @@ class Colony:
             return
         v = PatchView(p, self.mat_layer)
         self.patch_views[id(p)] = v
-        v.show()
+        if not self.hidden_for_fullscreen:
+            v.show()
         for w in self.widgets.values():
             w.raise_()
 
@@ -1631,7 +1896,8 @@ class Colony:
             if self.spitter_view:
                 self.spitter_view.close()
             self.spitter_view = SpitterWidget(self, self.mat_layer)
-            self.spitter_view.show()
+            if not self.hidden_for_fullscreen:
+                self.spitter_view.show()
             for w in self.widgets.values():
                 w.raise_()
         self.save()
@@ -1665,7 +1931,10 @@ class Colony:
     def spitter_tick(self):
         self.shots = [s for s in self.shots if not s.done]
         if self.spitter and time.time() >= self.spitter["next_at"]:
-            self.shoot()
+            if self.starving():                           # 全体饿扁：不喷，往后推
+                self.spitter["next_at"] = time.time() + self.shot_gap()
+            else:
+                self.shoot()
 
     def shoot(self, outcome: str | None = None, target: tuple[float, float] | None = None) -> SporeShot:
         sp, now = self.spitter, time.time()
@@ -1674,7 +1943,8 @@ class Colony:
         reach = spitter_image("idle").height() - 2 * PX
         start = (bx + ux * reach, by + uy * reach)
         shot = SporeShot(self, start, target or self.shot_target(start), outcome or self.pick_outcome())
-        shot.show()
+        if not self.hidden_for_fullscreen:
+            shot.show()
         self.shots.append(shot)
         sp["shots"] += 1
         sp["shot_at"], sp["next_at"] = now, now + self.shot_gap()
@@ -1687,6 +1957,7 @@ class Colony:
             self.spitter["stats"][outcome] += 1
         if outcome == "spore":
             c = self.new_creature(int(x), int(y))
+            c.satiety = HUNGRY_AT                         # 野生孢子，一落地就有点饿
             self.creatures.append(c)
             w = self.spawn_widget(c)
             w.play("land")
@@ -1770,12 +2041,23 @@ class Colony:
         c = widget.c
         before = c.stage
         widget.touch()
+        was = c.mood
         eaten, rejected = [], []
         for path in paths[:MAX_ITEMS_PER_DROP]:
             food, why = digest(path)
             if food is None:
                 rejected.append(why)
                 continue
+            if self.devour:
+                if food.targets and all(self.is_protected(t) for t in food.targets):
+                    rejected.append("这个不能吃")
+                    continue
+                done = self.devour_food(food)
+                if food.targets and not done:
+                    rejected.append("咬不动…")
+                    continue
+                if done < len(food.targets):
+                    food.value = max(1, round(food.value * done / len(food.targets)))
             value, note = food.value, food.note
             if food.key in c.eaten:
                 value, note = max(1, value // 4), note or "嚼过了"
@@ -1783,6 +2065,7 @@ class Colony:
                 c.eaten = (c.eaten + [food.key])[-500:]
             value *= self.gain_mult
             c.nutrition += value
+            c.satiety = min(SATIETY_MAX, c.satiety + value * SATIETY_PER_FOOD)
             c.feeds += 1
             c.log = (c.log + [[int(time.time()), food.label, value]])[-50:]
             eaten.append((value, note))
@@ -1799,15 +2082,56 @@ class Colony:
                 widget.say(f"+{value} {note}".strip(), delay=i * 0.35)
             if rejected:
                 widget.say(rejected[0], delay=len(eaten) * 0.35)
+            if was in ("starving", "dormant"):
+                widget.say("活过来了！", big=True)
         elif rejected:
             widget.play("shake")
             widget.say(rejected[0])
         self.after_growth(widget, before)
         self.save()
 
+    def is_protected(self, path: Path) -> bool:
+        """游戏自己的程序目录、存档目录里的东西不吃"""
+        try:
+            real = path.resolve()
+        except OSError:
+            return True
+        return any(real == d or d in real.parents for d in self.protected_dirs)
+
+    def devour_food(self, food: Food) -> int:
+        """真的吃掉：删除（Windows 进回收站）能吃的文件，清掉吃空的目录，记进 eaten.log。返回吃掉几个文件。"""
+        done = 0
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.data_dir / "eaten.log", "a", encoding="utf-8") as log:
+            for f in food.targets:
+                if self.is_protected(f):
+                    continue
+                try:
+                    size = f.stat().st_size
+                    devour_file(f)
+                except OSError:
+                    continue
+                done += 1
+                log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{size}\t{os.path.abspath(f)}\n")
+        for d in food.dirs:
+            if not self.is_protected(d):
+                try:
+                    os.rmdir(d)                            # 只删空目录
+                except OSError:
+                    pass
+        return done
+
+    def set_devour(self, on: bool):
+        self.devour = on
+        self.save()
+
     def after_growth(self, widget: CreatureWidget, before: int, quiet: bool = False):
         c = widget.c
-        if c.stage != before:
+        if c.stage < before:
+            widget.refit()
+            if not quiet:
+                widget.say(f"缩回 {c.stage_name}…")
+        elif c.stage > before:
             widget.refit()
             if not quiet:
                 widget.play("grow")
@@ -1867,6 +2191,8 @@ class Colony:
         info(f"AGE    {fmt_age(time.time() - c.born)}")
         info(f"GEN    {c.gen}")
         info(f"FOOD   {'█' * filled}{'░' * (10 - filled)} {int(c.nutrition)}/{hi}")
+        full = round(10 * c.satiety / SATIETY_MAX)
+        info(f"FULL   {'█' * full}{'░' * (10 - full)} {int(c.satiety)}%  {MOOD_NAMES[c.mood]}")
         info(f"FEEDS  {c.feeds}   SPORES {c.released}")
         m.addSeparator()
         log_menu = m.addMenu("最近吃的")
@@ -1877,6 +2203,10 @@ class Colony:
             log_menu.addAction("（还没吃过东西）").setEnabled(False)
         m.addAction("喂文件…", lambda: self.feed_dialog(widget, folder=False))
         m.addAction("喂文件夹…", lambda: self.feed_dialog(widget, folder=True))
+        devour = m.addAction("吞噬文件（吃掉后" + ("进回收站）" if sys.platform == "win32" else "删除）"))
+        devour.setCheckable(True)
+        devour.setChecked(self.devour)
+        devour.toggled.connect(self.set_devour)
         m.addSeparator()
         top = m.addAction("总在最前")
         top.setCheckable(True)
@@ -1966,14 +2296,19 @@ class Colony:
 def main():
     ap = argparse.ArgumentParser(description="FUNGI.EXE — 桌面真菌宠物 demo")
     ap.add_argument("--fast", action="store_true", help="调试：成长加速")
-    ap.add_argument("--data-dir", type=Path,
-                    default=Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "fungi")
+    default_dir = (Path(os.environ.get("APPDATA", Path.home())) if sys.platform == "win32"
+                   else Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))) / "fungi"
+    ap.add_argument("--data-dir", type=Path, default=default_dir)
     args = ap.parse_args()
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     lock = open(args.data_dir / "lock", "w")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         print("[fungi] 已经在运行了（同一个存档目录只能开一个）", file=sys.stderr)
         sys.exit(1)

@@ -13,7 +13,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QEventLoop, QMimeData, QPointF, Qt, QTimer, QUrl
+from PyQt6.QtCore import QEventLoop, QMimeData, QPointF, QRect, Qt, QTimer, QUrl
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage, QPainter
 from PyQt6.QtWidgets import QApplication
 
@@ -49,7 +49,11 @@ def shutdown(colony):
         w.timer.stop()
         w.close()
     colony.spitter_timer.stop()
-    for v in list(colony.mat_views.values()) + list(colony.patch_views.values()) + [colony.spitter_view] + colony.shots:
+    colony.fullscreen_timer.stop()
+    colony.screen_debounce.stop()
+    for s in colony.shots:
+        s.finish()
+    for v in list(colony.mat_views.values()) + list(colony.patch_views.values()) + [colony.spitter_view]:
         if v:
             v.close()
 
@@ -88,6 +92,7 @@ data = root / "save"
 
 print("1. 出生")
 colony = F.Colony(data)
+colony.devour = False                   # 1–5 节反复喂同一批文件，先关掉吞噬（第 12 节专门测）
 check("初始只有 1 只", len(colony.creatures) == 1)
 c = colony.creatures[0]
 w = colony.widgets[c.id]
@@ -141,7 +146,7 @@ w.drag_over = True
 drag_grab = w.grab()
 w.drag_over = False
 
-print("5. 文件完好")
+print("5. 关掉吞噬时文件完好")
 check("所有食物文件内容/修改时间/大小都没变", all(fingerprint(p) == before_prints[p] for p in all_files))
 check("食物文件一个不少", sorted(p for p in food.rglob("*") if p.is_file()) == sorted(all_files))
 
@@ -150,6 +155,7 @@ colony.save()
 snap = {k.id: (k.name, k.gen, k.born, k.feeds, k.nutrition, k.released) for k in colony.creatures}
 shutdown(colony)
 colony2 = F.Colony(data)
+check("吞噬开关随存档保存", colony2.devour is False)
 snap2 = {k.id: (k.name, k.gen, k.born, k.feeds, k.nutrition, k.released) for k in colony2.creatures}
 check("读档后成员一致", snap.keys() == snap2.keys())
 check("出生时间/喂食次数/代数/放出数完全一致",
@@ -472,6 +478,193 @@ sp2 = colony10.spitter
 check("读档后喷孢菌和菌斑都在", sp2 and (sp2["edge"], round(sp2["frac"], 4), sp2["shots"], sp2["stats"]) == snap_sp
       and [(p.x, p.y, round(p.r, 3), p.max, p.seed) for p in colony10.patches] == snap_patches)
 shutdown(colony10)
+
+print("12. 吞噬文件")
+dz = root / "devour"
+dz.mkdir()
+colony11 = F.Colony(root / "save12")
+check("默认开启吞噬", colony11.devour)
+c11 = colony11.creatures[0]
+w11 = colony11.widgets[c11.id]
+note = dz / "eat me.txt"
+note.write_text("x" * 2048)
+colony11.feed(w11, [note])
+check("txt 被吃掉（文件删除）并给营养", not note.exists() and round(c11.nutrition) == 13, f"{c11.nutrition:.1f}")
+check("eaten.log 记下完整路径和大小", f"2048\t{note}" in (root / "save12" / "eaten.log").read_text())
+pic = dz / "cat.png"
+pic.write_bytes(b"x" * 100)
+colony11.feed(w11, [pic])
+check("不能吃的类型原样保留", pic.exists())
+folder = dz / "notes"
+(folder / "deep" / "deeper").mkdir(parents=True)
+(folder / "img").mkdir()
+for rel in ("a.md", "b.txt", "deep/c.md", "deep/deeper/d.txt"):
+    (folder / rel).write_text("hi")
+(folder / "img" / "x.png").write_bytes(b"p")
+(folder / ".hidden.md").write_text("h")
+n = c11.nutrition
+colony11.feed(w11, [folder])
+check("文件夹：txt/md 被吃掉，图片和隐藏文件留下",
+      not any((folder / rel).exists() for rel in ("a.md", "b.txt", "deep/c.md", "deep/deeper/d.txt"))
+      and (folder / "img" / "x.png").exists() and (folder / ".hidden.md").exists() and c11.nutrition - n == 14)
+check("吃空的子目录清掉，还有东西的留下", not (folder / "deep").exists() and (folder / "img").exists() and folder.exists())
+only = dz / "only_notes"
+(only / "sub").mkdir(parents=True)
+(only / "x.md").write_text("y")
+(only / "sub" / "y.txt").write_text("y")
+colony11.feed(w11, [only])
+check("只有文字的文件夹整个被吃掉", not only.exists())
+dropped = dz / "dropped.md"
+dropped.write_text("z" * 300)
+_, dropev = drag(w11, [dropped], Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+check("拖放喂食也吃掉文件，拖放动作仍然只报 Copy", not dropped.exists() and dropev.dropAction() == Qt.DropAction.CopyAction)
+safe = dz / "safe"
+safe.mkdir()
+keep = safe / "keep.txt"
+keep.write_text("k")
+colony11.protected_dirs.append(safe.resolve())
+n = c11.nutrition
+colony11.feed(w11, [keep])
+check("保护区（程序目录、存档目录）里的不吃", keep.exists() and c11.nutrition == n and any("不能吃" in f["text"] for f in w11.floaters))
+check("程序目录默认受保护", colony11.is_protected(F.PROJECT_DIR / "fungi.py") and colony11.is_protected(root / "save12" / "save.json"))
+locked = dz / "locked"
+locked.mkdir()
+stuck = locked / "stuck.txt"
+stuck.write_text("s")
+os.chmod(locked, 0o555)
+n = c11.nutrition
+colony11.feed(w11, [stuck])
+os.chmod(locked, 0o755)
+check("删不掉就咬不动、不给营养", stuck.exists() and c11.nutrition == n and any("咬不动" in f["text"] for f in w11.floaters))
+colony11.devour = False
+again = dz / "again.txt"
+again.write_text("a" * 500)
+n = c11.nutrition
+colony11.feed(w11, [again])
+check("关掉吞噬：给营养但不删文件", again.exists() and c11.nutrition > n)
+shutdown(colony11)
+
+print("13. 饥饿")
+colony12 = F.Colony(root / "save13")
+c = colony12.creatures[0]
+w = colony12.widgets[c.id]
+c.satiety, c.nutrition = 100, 120
+colony12.metabolize(c, 3600)
+check("吃饱时正常长（1 小时 +30）", abs(c.nutrition - 150) < 1e-6 and abs(c.satiety - (100 - 100 / F.HUNGER_HOURS)) < 1e-6)
+c.satiety = 20
+n = c.nutrition
+colony12.metabolize(c, 3600)
+check("饿了生长减半", abs(c.nutrition - n - 15) < 1e-6 and c.mood == "hungry")
+c.satiety = 100
+colony12.metabolize(c, F.HUNGER_HOURS * 3600)
+check(f"不喂食 {F.HUNGER_HOURS} 小时从吃饱到饿扁", c.satiety == 0 and c.mood == "starving")
+c.nutrition = F.STAGES[3][1] + 2
+colony12.metabolize(c, 3600)
+w.tick()
+check("饿扁后掉营养、缩回上一阶段", c.stage == 2 and w.shown_stage == 2, c.stage_name)
+now = time.time()
+w.blinks = [now + 100]
+w.anim = None
+starving_img = w.current_pixmap(now).toImage()
+check("饿扁了用专门的帧并变灰",
+      starving_img in [F.art_pixmap(2, 3, False, False, False, b, 0, True, "starving").toImage() for b in (False, True)]
+      and F.art_pixmap(2, 3, False, False, False, False, 0, True, "starving").toImage()
+      != F.art_pixmap(2, 3, False, False, False, False, 0, True, "full").toImage())
+w.idle_at = 0
+w.floaters = []
+w.idle(time.time())
+check("饿扁了不蹦跶，只会嘟囔或眨眼", w.anim is None)
+c.satiety, c.nutrition = 20, 60
+w.tick()
+hungry_img = w.current_pixmap(time.time()).toImage()
+check("饿了用专门的帧（不变灰）",
+      hungry_img in [F.art_pixmap(2, 3, False, False, False, b, 0, False, "hungry").toImage() for b in (False, True)]
+      and F.art_pixmap(2, 3, False, False, False, False, 0, False, "hungry").toImage() != F.art_pixmap(2).toImage())
+w.floaters = []
+w.do_idle("grumble")
+check("饿了会嘟囔", w.floaters and w.floaters[-1]["text"] in ("饿…", "咕…", "……", "想吃 .txt"))
+c.satiety, c.nutrition = 0, 3
+colony12.metabolize(c, 3600)
+w.tick()
+check("营养掉光变成休眠孢子（不会死）", c.mood == "dormant" and c.stage == 0)
+w.idle_at, w.floaters, w.anim = 0, [], None
+w.last_touch = 0
+w.idle(time.time())
+check("休眠时一动不动、不睡觉冒 z", w.anim is None and not w.asleep and not w.floaters)
+check("休眠孢子是灰的", w.current_pixmap(time.time()).toImage() == F.art_pixmap(0, 3, wither=True).toImage())
+colony12.devour = False
+colony12.feed(w, [txt if txt.exists() else md])
+check("喂一次就活过来", c.mood == "full" and any("活过来了" in f["text"] for f in w.floaters), f"饱腹 {c.satiety:.0f}")
+m12 = colony12.mat
+for i in range(60):
+    for _ in range(4):
+        m12.bump(i)
+c.satiety, c.nutrition = 0, 0
+before = sum(m12.d)
+for _ in range(300):
+    colony12.mat_step()
+check("全体饿扁时边缘菌毯慢慢退", sum(m12.d) < before, f"{before} → {sum(m12.d)}")
+colony12.plant_spitter(10, quiet=True)
+shots = colony12.spitter["shots"]
+colony12.spitter["next_at"] = time.time() - 1
+colony12.spitter_tick()
+check("全体饿扁时喷孢菌暂停", colony12.spitter["shots"] == shots and colony12.spitter["next_at"] > time.time())
+c.satiety, c.nutrition = 50, 100
+colony12.save()
+shutdown(colony12)
+raw = json.loads((root / "save13" / "save.json").read_text())
+raw["last_seen"] -= 40 * 3600
+(root / "save13" / "save.json").write_text(json.dumps(raw))
+colony13 = F.Colony(root / "save13")
+c = colony13.creatures[0]
+check("关掉 40 小时：先长后饿，掉的营养有上限", c.satiety == 0 and abs(c.nutrition - (100 + F.OFFLINE_CAP - F.OFFLINE_STARVE_CAP)) < 0.5,
+      f"{c.nutrition:.1f}")
+check("回来时提示饿瘦了", any("饿瘦了" in f["text"] for f in colony13.widgets[c.id].floaters))
+shutdown(colony13)
+
+print("14. Windows 适配（菌毯）")
+colony14 = F.Colony(root / "save14")
+m14 = colony14.mat
+for i in range(m14.n):
+    if i % 3 == 0:
+        for _ in range(5):
+            m14.bump(i)
+colony14.check_spitter(quiet=True)
+if not colony14.spitter:
+    colony14.plant_spitter(m14.index_at("bottom", 50), quiet=True)
+occupied = m14.occupied()
+old_area = colony14.mat_area()
+new_area = QRect(0, 0, old_area.width() - 120, old_area.height() - 48)    # 比如任务栏变宽、改了缩放
+F.Colony.mat_area = lambda self: new_area
+colony14.on_screen_changed()
+check("桌面可用区域变了：菌毯按比例重铺", (m14 := colony14.mat).cols == new_area.width() // F.PX and abs(m14.occupied() - occupied) < 0.05)
+g = colony14.mat_views["right"].geometry()
+check("边缘窗口贴着新的可用区域", g.right() == new_area.width() - 1 and colony14.mat_views["bottom"].geometry().bottom() == new_area.height() - 1)
+sp14 = colony14.spitter
+check("喷孢菌跟着挪到对应位置", m14.edge_of(sp14["i"]) == (sp14["edge"], min(m14.edge_len(sp14["edge"]) - 1, int(sp14["frac"] * m14.edge_len(sp14["edge"])))))
+F.Colony.mat_area = lambda self: old_area
+colony14.on_screen_changed()
+colony14.set_fullscreen_hidden(True)
+views = list(colony14.mat_views.values()) + list(colony14.widgets.values()) + [colony14.spitter_view]
+check("前台全屏：菌毯、喷孢菌、宠物都藏起来", not any(v.isVisible() for v in views))
+colony14.shoot("spore", (300, 300))
+wait(2.2)
+check("藏着的时候长出来的东西也不冒出来", not any(w.isVisible() for w in colony14.widgets.values()))
+F.Colony.mat_area = lambda self: new_area
+colony14.on_screen_changed()
+check("藏着的时候屏幕变了，先不重铺", colony14.views_stale)
+colony14.set_fullscreen_hidden(False)
+F.Colony.mat_area = lambda self: old_area
+check("退出全屏都出来，并按新区域重铺", all(w.isVisible() for w in colony14.widgets.values())
+      and colony14.spitter_view.isVisible() and not colony14.views_stale
+      and colony14.mat_views["right"].geometry().right() == new_area.width() - 1)
+real_fs = F.foreground_fullscreen
+F.foreground_fullscreen = lambda: True
+colony14.check_fullscreen()
+F.foreground_fullscreen = real_fs
+check("全屏检测接到隐藏", colony14.hidden_for_fullscreen)
+check("非 Windows 上不检测全屏", F.foreground_fullscreen() is False and not colony14.fullscreen_timer.isActive())
+shutdown(colony14)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
