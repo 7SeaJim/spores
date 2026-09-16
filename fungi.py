@@ -181,6 +181,29 @@ STYLE_DIRECTIVES = {
     "burp": "打个嗝，嗝出这块残渣：「{frag}」，格式像「（嗝）……「{frag}」。」，可以接半句，但不解释是谁的。",
     "return": "立刻岔回去，像什么都没发生过：说一件跟刚才毫不相干的小事。",
 }
+# 没接 API（或连不上）时的本地回复：同样是文件菇·电波，素材来自存档；台词是新写的，不复用上面的样本
+OFFLINE = "__offline__"
+LOCAL_DETOUR = ("「{w}」闻着是松的，我们先把它埋进缓存里。", "{w}要是往下长，我们早就在它底下了。",
+                "把「{w}」放久一点，它会自己变软。", "{w}？是菌毯边上刚冒出来的那一小团吧。")
+LOCAL_LORE = (".md 放久了会发酥，这个你知道吧。", "重名的文件比单独一个的香一点。", "回收站里的东西是凉的，要焐一会儿才好吃。",
+              "文件夹套得越深，里面越潮。", "改名叫「最终版」的，通常还会再长一层。")
+LOCAL_DIGEST = ("嗯咕……等等，这一口还卡着没化开。", "里面又包了一层，得慢慢解。", "咬到一个很大的，先别说话。", "这团还在往下沉，等它沉到底。")
+LOCAL_RETURN = ("……刚才菌丝那头动了一下。", "嗯？边上的菌毯又往前挪了一格。", "……你那边是不是起风了。")
+LOCAL_NORMAL = ("嗯，我们在听，菌丝都朝着你这边。", "知道了，先放在我们底下那层。", "好，我们记着，记在菌毯最里面。")
+LOCAL_STOP = re.compile(r"[你我他她它的了吗呢吧啊么是在这那个什怎为不要会想有没就都也还很]")
+
+
+def pick_word(text: str, rng=random) -> str:
+    """从对方的话里揪一个词（岔轨用）：两字的中文片段或英文单词，跳过虚词"""
+    words = []
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", text or ""):
+        if chunk.isascii():
+            words.append(chunk)
+            continue
+        words += [chunk[i:i + 2] for i in range(len(chunk) - 1) if not LOCAL_STOP.search(chunk[i:i + 2])]
+    return rng.choice(words) if words else ""
+
+
 # 口味：命名乱 / 重复 / 放得久 = 肥；已归档 = 干；云盘里的够不到
 MESSY_NAME = re.compile(r"\(\d+\)|（\d+）|副本|复件|copy|final|最终|终版|定稿|真的|v\d+|新建|untitled|未命名|无标题|temp|tmp|旧|old|"
                         r"备份|bak|请勿删除|勿删|待办|草稿|draft|asdf|aaa|qwe|test|测试|\d{6,}", re.I)
@@ -659,7 +682,9 @@ def foreground_fullscreen() -> bool:
 
 
 class ChatError(Exception):
-    pass
+    def __init__(self, message: str, offline: bool = False):
+        super().__init__(message)
+        self.offline = offline                            # 断网 / 超时：改用本地回复；Key 错、没余额：照实说
 
 
 def one_sentence(text: str, limit: int = CHAT_MAX_CHARS) -> str:
@@ -767,7 +792,7 @@ def chat_request(cfg: dict, messages: list[dict], timeout: float = CHAT_TIMEOUT)
     except urllib.error.HTTPError as err:
         raise ChatError(CHAT_ERRORS.get(err.code, f"出错了（{err.code}）")) from err
     except (urllib.error.URLError, TimeoutError, OSError) as err:
-        raise ChatError("连不上…") from err
+        raise ChatError("连不上…", offline=True) from err
     except ValueError as err:
         raise ChatError("听不懂回话") from err
     try:
@@ -1899,7 +1924,8 @@ class ChatInput(QWidget):
         self.colony, self.owner = colony, owner
         self.line = ChatLine(self)
         self.line.setMaxLength(200)
-        self.line.setPlaceholderText(f"对 {owner.c.name} 说…（回车发送）")
+        self.line.setPlaceholderText(f"对 {owner.c.name} 说…（回车发送）" if colony.chat_ready()
+                                     else f"对 {owner.c.name} 说…（没接 API，它用自己的话回你）")
         self.line.setStyleSheet(f"QLineEdit {{ background:{PAPER.name()}; color:{INK.name()}; border:2px solid {INK.name()};"
                                 f" padding:4px 6px; font-family:'DejaVu Sans Mono','Consolas','Noto Sans CJK SC','Microsoft YaHei UI',monospace;"
                                 f" font-size:13px; font-weight:bold; selection-background-color:{INK.name()}; }}")
@@ -2233,11 +2259,7 @@ class Colony:
         ChatSettings(self).exec()
 
     def open_chat(self, widget: CreatureWidget):
-        if not self.chat_ready():
-            self.chat_settings()
-            if not self.chat_ready():
-                return
-        box = ChatInput(self, widget)
+        box = ChatInput(self, widget)                     # 没接 API 也能聊：它用自己的话回
         box.popup()
         return box
 
@@ -2373,6 +2395,64 @@ class Colony:
                       lambda m: ("被喂了一口" if m.group(1) == "1" else "被喂了好几口") + (f"，{m.group(2)}" if m.group(2) else ""), text)
         return text
 
+    def local_reply(self, c: Creature, text: str, style: str) -> str:
+        """没接 API 或连不上时，程序自己用文件菇的话回一句：按同样挑好的说法，素材全来自存档"""
+        last = next((m["content"] for m in reversed(self.memory.get(c.id, [])) if m["role"] == "assistant"), "")
+
+        def choose(pool):
+            return random.choice([x for x in pool if x != last] or list(pool))
+        line = ""
+        if style == "burp":
+            piece = self.pick_residue(c.id)
+            line = f"（嗝）……「{self.fragment(piece)}」。" if piece else choose(LOCAL_DIGEST)
+        elif style == "突然具体":
+            line = random.choice(self.concrete_facts(c)) + "。"
+        elif style == "岔轨":
+            word = pick_word(text)
+            line = choose(LOCAL_DETOUR).format(w=word) if word else choose(LOCAL_LORE)
+        elif style == "私有常识":
+            line = choose(LOCAL_LORE)
+        elif style == "消化中":
+            line = choose(LOCAL_DIGEST)
+        elif style == "return":
+            line = choose(LOCAL_RETURN)
+        elif style == "lucid":
+            line = LUCID_LINES[0] if LUCID_ABOUT_FILES.search(text) else LUCID_LINES[1]
+        else:
+            line = self.local_answer(c, text) or choose(LOCAL_NORMAL)
+        if c.mood == "starving" and style not in ("lucid",):
+            line = "……好饿，" + line.lstrip("…")
+        return filegu_clean(one_sentence(line), tuple(r["name"] for r in self.residue.get(c.id, [])) + tuple(
+            r["line"] for r in self.residue.get(c.id, []) if r.get("line")))
+
+    def local_answer(self, c: Creature, text: str) -> str:
+        """「正常回答」的本地版：按关键词回，用存档里的真事"""
+        for o in self.creatures:
+            if o is not c and o.name.lower() in text.lower():
+                rel = self.relation(c, o).split("（")[0].replace("你", "我")    # 人设里是「你」的视角，自己说话换成「我」
+                return f"{o.name} 是{rel}，现在{MOOD_CN[o.mood]}。"
+        names = {o.id: o.name for o in self.creatures}
+        if re.search(r"你是谁|你叫|名字|who are", text, re.I):
+            family = ("菌落里最早冒出来的那一只" if not c.parent and c.gen == 1 else "喷孢菌喷出来的野孢子" if c.parent == "spitter"
+                      else f"{names[c.parent]} 放出来的孢子" if c.parent in names else "母体已经不在了的那一只")
+            return f"我是 {c.name}，{family}。"
+        if re.search(r"吃|饿|饱|喂", text):
+            return {"full": "吃饱了，那几团松的还在肚子里慢慢化。", "hungry": "有点饿，拖个 .txt 过来吧。",
+                    "starving": "随便给一口 .md 就行。"}.get(c.mood, "")
+        if re.search(r"累|困|烦|难过|不开心|压力|崩溃", text):
+            return "那就别整理了，乱着放，我们替你守着。"
+        if re.search(r"晚安|睡了|拜拜|再见|明天见|走了", text):
+            return "嗯，我们在菌毯里趴着，等你回来。"
+        if re.search(r"整理|删|清理|收拾|归档", text):
+            return "别整，那几团还松着，正好够我们啃一口。"
+        if re.search(r"喜欢|爱你|想你", text):
+            return "喜欢，你桌面乱得刚刚好。"
+        if re.search(r"菌毯|孢子|菌斑|喷孢菌", text):
+            return "菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied()) + "，还在往前摸。"
+        if re.search(r"你好|在吗|在不在|hi|hello|嗨", text, re.I):
+            return "在，我们一直趴在这儿。"
+        return ""
+
     def concrete_facts(self, c: Creature) -> list[str]:
         """「突然具体」能用的素材：全部来自存档，不让它自己编"""
         facts = []
@@ -2439,7 +2519,8 @@ class Colony:
             style = "lucid"                               # 问到「你是不是 AI」这种时候，正是落点句的时候
         else:
             style = pick_style(mem, has_residue=bool(self.residue.get(c.id)))
-        if style != "lucid" and len(self.chat_calls) >= limit:
+        online = self.chat_ready()
+        if online and style != "lucid" and len(self.chat_calls) >= limit:
             wait_min = max(1, math.ceil((window - (now - self.chat_calls[0])) / 60))
             self.show_bubble(widget, f"（聊太多了，菌丝要歇 {wait_min} 分钟）", error=True)
             return
@@ -2450,6 +2531,9 @@ class Colony:
         if style == "lucid":                              # 落点句程序直接说，保证说对、每段只一次
             line = LUCID_LINES[0] if LUCID_ABOUT_FILES.search(text) else LUCID_LINES[1]   # 聊到删文件、整理才说「替你留着」
             QTimer.singleShot(900, lambda: self.on_chat_reply(c.id, text, line, "", "lucid"))
+            return
+        if not online:                                    # 没接 API：程序自己回
+            QTimer.singleShot(random.randint(500, 900), lambda: self.on_chat_reply(c.id, text, "", OFFLINE, style))
             return
         directive, allowed = STYLE_DIRECTIVES[style], ()
         if style == "burp":
@@ -2480,7 +2564,7 @@ class Colony:
                 reply = filegu_clean(one_sentence(chat_request(cfg, again, cfg.get("timeout", CHAT_TIMEOUT))), allowed)
             err = ""
         except ChatError as e:
-            reply, err = "", str(e)
+            reply, err = "", OFFLINE if e.offline else str(e)
         self.chat_bridge.done.emit(cid, text, reply, err, style)
 
     def on_chat_reply(self, cid: str, text: str, reply: str, err: str, style: str = "normal"):
@@ -2490,12 +2574,18 @@ class Colony:
             return
         w.thinking = False
         w.floaters = [f for f in w.floaters if f["text"] != "…"]
+        local = err == OFFLINE
+        if local:
+            reply, err = self.local_reply(w.c, text, style), ""
         if err:
             self.show_bubble(w, f"（{err}）", error=True)
             return
         now = int(time.time())
         history = self.memory.setdefault(cid, [])
-        history += [{"role": "user", "content": text, "t": now}, {"role": "assistant", "content": reply, "t": now, "style": style}]
+        said = {"role": "assistant", "content": reply, "t": now, "style": style}
+        if local:
+            said["local"] = True
+        history += [{"role": "user", "content": text, "t": now}, said]
         del history[:-CHAT_MEMORY]
         self.save_memory()
         self.show_bubble(w, reply)

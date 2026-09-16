@@ -49,6 +49,15 @@ def wait(sec):
     loop.exec()
 
 
+def wait_reply(colony, cid, limit=8.0):
+    """等聊天回复回来（Windows 上连不上的端口要重试好几秒）"""
+    t0 = time.time()
+    wait(0.1)
+    while cid in colony.chat_pending and time.time() - t0 < limit:
+        wait(0.1)
+    wait(0.1)
+
+
 def fingerprint(path: Path):
     st = path.stat()
     return hashlib.sha1(path.read_bytes()).hexdigest(), st.st_mtime_ns, st.st_size
@@ -662,6 +671,8 @@ shutdown(colony13)
 
 print("14. Windows 适配（菌毯）")
 colony14 = F.Colony(root / "save14")
+fs_timer_on = colony14.fullscreen_timer.isActive()
+colony14.fullscreen_timer.stop()             # Windows 上定时检查会中途把窗口放出来，打乱下面的步骤
 m14 = colony14.mat
 for i in range(m14.n):
     if i % 3 == 0:
@@ -702,9 +713,9 @@ colony14.check_fullscreen()
 F.foreground_fullscreen = real_fs
 check("全屏检测接到隐藏", colony14.hidden_for_fullscreen)
 if IS_WIN:
-    check("Windows：真实全屏检测能跑、定时检查已开启", REAL_FULLSCREEN() in (True, False) and colony14.fullscreen_timer.isActive())
+    check("Windows：真实全屏检测能跑、定时检查已开启", REAL_FULLSCREEN() in (True, False) and fs_timer_on)
 else:
-    check("非 Windows 上不检测全屏", REAL_FULLSCREEN() is False and not colony14.fullscreen_timer.isActive())
+    check("非 Windows 上不检测全屏", REAL_FULLSCREEN() is False and not fs_timer_on)
 shutdown(colony14)
 
 print("15. 聊天（DeepSeek）")
@@ -807,12 +818,12 @@ with socket.socket() as sock:
     dead_port = sock.getsockname()[1]
 colony15.chat_cfg.update(api_key="good", base_url=f"http://127.0.0.1:{dead_port}")
 colony15.send_chat(w15, "在吗")
-wait(1.0)
-check("连不上时气泡说连不上", "连不上" in colony15.bubbles[c15.id].text)
+wait_reply(colony15, c15.id)
+check("连不上时改用本地回复，不报错", not colony15.bubbles[c15.id].error and colony15.memory[c15.id][-1].get("local"))
 colony15.chat_cfg.update(api_key="slow", base_url=fake_url, timeout=0.5)
 colony15.send_chat(w15, "慢慢说")
-wait(1.3)
-check("超时也不卡界面，显示连不上", "连不上" in colony15.bubbles[c15.id].text and not w15.thinking)
+wait_reply(colony15, c15.id)
+check("超时也不卡界面，改用本地回复", not colony15.bubbles[c15.id].error and colony15.memory[c15.id][-1].get("local") and not w15.thinking)
 colony15.chat_cfg.pop("timeout")
 colony15.chat_cfg["api_key"] = "good"
 wait(1.0)
@@ -1183,6 +1194,61 @@ F.chat_request, F.pick_style = real_request, real_pick
 check("回得太短（「嗯？」）会让它说完整一句", len(calls23) == 2 and "太短" in calls23[-1][-1]["content"]
       and colony23.bubbles[c23.id].text == "嗯，明天我们还在这团里。")
 shutdown(colony23)
+
+print("22. 没接 API 也能聊（本地回复）")
+colony24 = F.Colony(root / "save24")
+mom24 = colony24.creatures[0]
+w24 = colony24.widgets[mom24.id]
+mom24.nutrition, mom24.satiety = F.STAGES[F.ADULT][1] + 1, 100
+colony24.after_growth(w24, 0)
+kid24 = colony24.creatures[1]
+colony24.chat_cfg = {}
+real_settings = F.ChatSettings.exec
+F.ChatSettings.exec = lambda self: (_ for _ in ()).throw(AssertionError("没接 API 时不该弹设置"))
+box24 = colony24.open_chat(w24)
+F.ChatSettings.exec = real_settings
+check("没接 API 双击直接出输入框，提示会用本地回复", box24 is not None and "没接 API" in box24.line.placeholderText())
+box24.close()
+calls24, real_request, real_pick = [], F.chat_request, F.pick_style
+F.chat_request = lambda *a, **k: calls24.append(1) or "不该调到模型这里。"
+
+
+def say24(text, style):
+    F.pick_style = lambda *a, **k: style
+    colony24.chat_last[mom24.id] = 0
+    colony24.send_chat(w24, text)
+    wait_reply(colony24, mom24.id, 3)
+    return colony24.bubbles[mom24.id].text
+
+
+who = say24("你是谁", "normal")
+check("「你是谁」：报名字和出身", mom24.name in who and "最早" in who, who)
+knows = say24(f"你认识 {kid24.name} 吗", "normal")
+check(f"问到 {kid24.name}：说出真实关系和状态（第一人称）", kid24.name in knows and "我放出来的孩子" in knows, knows)
+detour = say24("外面在下雨", "岔轨")
+check("岔轨：从你的话里揪一个词", any(w in detour for w in ("外面", "下雨")), detour)
+fact = say24("你在看什么", "突然具体")
+check("突然具体：用存档里的真事", any(f[:6] in fact for f in colony24.concrete_facts(mom24)), fact)
+colony24.residue[mom24.id] = [{"name": "aaa.txt", "line": "待办_旧_请勿删除", "year": 2019, "burped": 0}]
+burp = say24("你吃了啥", "burp")
+check("打嗝：嗝出真实残渣", burp in ("（嗝）……「aaa.txt」。", "（嗝）……「待办_旧_请勿删除」。"), burp)
+check("没接 API 时一次都没调模型", not calls24)
+said24 = [m for m in colony24.memory[mom24.id] if m["role"] == "assistant"]
+check("本地回复记进记忆并标 local", said24 and all(m.get("local") for m in said24))
+check("本地回复也守规矩：一句话、不超长、没有感叹号", all(len(m["content"]) <= F.CHAT_MAX_CHARS and "！" not in m["content"] for m in said24))
+mom24.satiety = 0
+weak = say24("你还好吗", "消化中")
+check("饿扁时说话有气无力", weak.startswith("……好饿"), weak)
+mom24.satiety = 100
+colony24.chat_cfg = {"api_key": "x"}
+F.chat_request = lambda *a, **k: (_ for _ in ()).throw(F.ChatError("连不上…", offline=True))
+off = say24("在吗", "normal")
+check("接了 Key 但连不上：改用本地回复，不报错", not colony24.bubbles[mom24.id].error and "连不上" not in off, off)
+F.chat_request = lambda *a, **k: (_ for _ in ()).throw(F.ChatError("API Key 不对"))
+bad = say24("在吗", "normal")
+check("Key 不对：照实说出来，不拿本地回复糊弄", "API Key 不对" in bad and colony24.bubbles[mom24.id].error)
+F.chat_request, F.pick_style = real_request, real_pick
+shutdown(colony24)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
