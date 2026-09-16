@@ -25,12 +25,16 @@ import math
 import os
 import random
 import re
+import shutil
 import signal
+import struct
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import wave
 from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
@@ -45,7 +49,8 @@ from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-                             QLabel, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout, QWidget)
+                             QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu, QMessageBox, QPushButton,
+                             QSlider, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget)
 
 # ───────────────────────────── 可调参数 ─────────────────────────────
 
@@ -232,6 +237,7 @@ GLOOMY_AT = 30             # 快乐低于这个：会嘟囔
 CHEERY_AT = 70             # 快乐高于这个：更爱蹦跶
 CARE_COOLDOWN = 1800       # 浇水、晒太阳的冷却（秒）
 CARE_AMOUNT = 20           # 浇水 +精力，晒太阳 +快乐
+SPEED_RANGE = (0.25, 3.0)  # CONFIG 里成长速度、饥饿速度的范围
 
 # 后缀: (营养倍率, 每 1 营养加多少精力, 每 1 营养加多少快乐, 飘字)
 FOOD_KINDS = {
@@ -916,6 +922,110 @@ TILT_STEPS = (-1, -1, 0, 1, 1, 0)
 DUST = QColor(85, 82, 76)
 
 
+# ───────────────────────────── 声音（标准库合成 WAV，不依赖 QtMultimedia） ─────────────────────────────
+
+SOUND_RATE = 22050
+SOUND_VOLUME = 0.22
+SOUND_GAP = 0.12           # 同一个声音最短间隔（秒）
+SOUND_VERSION = 1          # 改了合成参数就加一，重新生成 WAV
+
+
+def tone(freq0: float, freq1: float, dur: float, wave_kind: str = "square", noise: float = 0.0,
+         attack: float = 0.004, vol: float = 1.0) -> list[float]:
+    """一段滑音：频率从 freq0 滑到 freq1，指数衰减包络"""
+    rng = random.Random(7)
+    n, out, phase = int(SOUND_RATE * dur), [], 0.0
+    for i in range(n):
+        k = i / max(1, n - 1)
+        phase += (freq0 + (freq1 - freq0) * k) / SOUND_RATE
+        x = phase % 1.0
+        v = (1.0 if x < 0.5 else -1.0) if wave_kind == "square" else math.sin(2 * math.pi * x)
+        if noise:
+            v = v * (1 - noise) + rng.uniform(-1, 1) * noise
+        env = min(1.0, i / max(1, SOUND_RATE * attack)) * math.exp(-4.0 * k)
+        out.append(v * env * vol)
+    return out
+
+
+def rest(dur: float) -> list[float]:
+    return [0.0] * int(SOUND_RATE * dur)
+
+
+SOUND_RECIPES = {
+    "eat": lambda: tone(190, 110, 0.06, noise=0.3) + rest(0.05) + tone(170, 100, 0.06, noise=0.3) + rest(0.05) + tone(150, 90, 0.08, noise=0.3),
+    "burp": lambda: tone(110, 62, 0.28, noise=0.35, attack=0.03),
+    "grow": lambda: sum((tone(f, f, 0.07, vol=0.7) for f in (523, 659, 784, 1046)), []),
+    "spores": lambda: tone(700, 1300, 0.05, "sine") + tone(1300, 600, 0.09, "sine"),
+    "spit": lambda: tone(900, 280, 0.08, "sine", vol=0.8),
+    "poke": lambda: tone(880, 990, 0.04, vol=0.6),
+    "deny": lambda: tone(160, 150, 0.08) + rest(0.04) + tone(130, 120, 0.1),
+    "water": lambda: tone(380, 720, 0.07, "sine") + rest(0.03) + tone(420, 820, 0.07, "sine"),
+    "sun": lambda: tone(660, 660, 0.08, "sine") + tone(880, 880, 0.08, "sine") + tone(990, 990, 0.14, "sine"),
+    "salt": lambda: tone(3000, 2200, 0.3, "sine", noise=0.9, attack=0.01, vol=0.8),
+}
+
+
+def write_wav(path: Path, samples: list[float]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with wave.open(str(tmp), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SOUND_RATE)
+        w.writeframes(b"".join(struct.pack("<h", int(max(-1.0, min(1.0, v * SOUND_VOLUME)) * 32767)) for v in samples))
+    os.replace(tmp, path)
+
+
+def find_player() -> list[str] | None:
+    """能放 WAV 的办法：Windows 用 winsound；其余找命令行播放器"""
+    if sys.platform == "win32":
+        return ["winsound"]
+    for cmd in (["afplay"], ["pw-play"], ["paplay"], ["aplay", "-q"]):
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+
+class Sound:
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self.enabled = True
+        self.player = find_player()
+        self.last: dict[str, float] = {}
+
+    @property
+    def available(self) -> bool:
+        return self.player is not None
+
+    def path(self, name: str) -> Path:
+        p = self.folder / f"{name}.v{SOUND_VERSION}.wav"
+        if not p.exists():
+            write_wav(p, SOUND_RECIPES[name]())
+        return p
+
+    def play(self, name: str) -> bool:
+        now = time.time()
+        if not self.enabled or not self.available or now - self.last.get(name, 0) < SOUND_GAP:
+            return False
+        self.last[name] = now
+        try:
+            self.spawn(self.path(name))
+        except (OSError, RuntimeError) as err:
+            print(f"[fungi] 声音放不出来：{err}", file=sys.stderr)
+            self.player = None
+            return False
+        return True
+
+    def spawn(self, path: Path):
+        if self.player == ["winsound"]:
+            import winsound
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            return
+        cmd = self.player + [str(path)]
+        threading.Thread(target=lambda: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                         daemon=True).start()
+
+
 # ───────────────────────────── 单只菌的窗口 ─────────────────────────────
 
 class CreatureWidget(QWidget):
@@ -946,6 +1056,7 @@ class CreatureWidget(QWidget):
         self.phase = random.uniform(0, BREATH_PERIOD)   # 错开每只菌的呼吸
         self.last_touch = now
         self.asleep = False
+        self.jolt_until = 0.0
         self.z_at = 0.0
         self.z_n = 0
         self.shown_mood = creature.mood
@@ -979,7 +1090,14 @@ class CreatureWidget(QWidget):
         # 精灵底部 = 脚底锚点；描边占 1 格。飞行中传入显示位置，存档里的 c.x/c.y 始终是落点
         x = self.c.x if x is None else x
         y = self.c.y if y is None else y
+        left = self.jolt_until - time.time()
+        if left > 0:                                            # 震一下：左右抖，越抖越小
+            x += (PX if int(left * 40) % 2 else -PX) * (1 + int(left * 6))
         self.move(int(x - self.width() / 2), int(y - (self.height() - BOTTOM_PAD) + PX))
+
+    def jolt(self, dur: float = 0.35):
+        if not sip.isdeleted(self) and self.colony.shake:
+            self.jolt_until = time.time() + dur
 
     def update_mask(self):
         """tight: 只有精灵附近；band: 再加精灵正上方一条（z、孢子尘）；full: 整窗（飘字、跳跃、悬停）"""
@@ -1134,6 +1252,10 @@ class CreatureWidget(QWidget):
 
     def tick(self):
         now = time.time()
+        if self.jolt_until and not self.flight:
+            if now > self.jolt_until:
+                self.jolt_until = 0.0
+            self.place()
         if self.flight and now >= self.flight["t0"]:
             f = self.flight
             k = min(1.0, (now - f["t0"]) / f["dur"])
@@ -1308,6 +1430,7 @@ class CreatureWidget(QWidget):
             self.colony.save()
         else:
             self.play("poke")
+            self.colony.sound.play("poke")
             self.say(random.choice(["?", "…", "!", "嗯？"]) if self.c.stage else "·")
             self.c.happiness = min(100.0, self.c.happiness + 2)       # 被戳一下有点开心
 
@@ -2072,6 +2195,242 @@ class ChatSettings(QDialog):
         super().accept()
 
 
+# ───────────────────────────── 状态面板 ─────────────────────────────
+
+class PixelBar(QWidget):
+    """分格的像素条"""
+    CELLS = 12
+
+    def __init__(self):
+        super().__init__()
+        self.value = 0.0
+        self.setFixedSize(self.CELLS * 9 + 6, 16)
+
+    def set_value(self, v: float):
+        v = max(0.0, min(100.0, v))
+        if v != self.value:
+            self.value = v
+            self.update()
+
+    def lit(self) -> int:
+        return math.ceil(self.value / 100 * self.CELLS - 1e-9)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), INK)
+        p.fillRect(self.rect().adjusted(2, 2, -2, -2), PAPER)
+        for i in range(self.CELLS):
+            p.fillRect(QRect(4 + i * 9, 4, 7, 8), INK if i < self.lit() else QColor(222, 219, 208))
+        p.end()
+
+
+PANEL_QSS = f"""
+QWidget#panel {{ background:{PAPER.name()}; border:2px solid {INK.name()}; }}
+QWidget {{ color:{INK.name()}; font-family:'DejaVu Sans Mono','Consolas','Noto Sans CJK SC','Microsoft YaHei UI',monospace;
+          font-size:12px; font-weight:bold; }}
+QLabel#title {{ background:{INK.name()}; color:{PAPER.name()}; padding:4px 6px; }}
+QPushButton {{ background:{PAPER.name()}; border:2px solid {INK.name()}; padding:4px 8px; }}
+QPushButton:hover {{ background:{INK.name()}; color:{PAPER.name()}; }}
+QPushButton:disabled {{ color:#9a978d; border-color:#9a978d; }}
+QPushButton#close {{ border:none; background:{INK.name()}; color:{PAPER.name()}; padding:2px 8px; }}
+QTabWidget::pane {{ border:2px solid {INK.name()}; top:-2px; background:{PAPER.name()}; }}
+QTabBar::tab {{ background:{PAPER.name()}; border:2px solid {INK.name()}; padding:3px 10px; margin-right:-2px; }}
+QTabBar::tab:selected {{ background:{INK.name()}; color:{PAPER.name()}; }}
+QListWidget {{ background:{PAPER.name()}; border:none; }}
+QSlider::groove:horizontal {{ height:6px; background:{PAPER.name()}; border:2px solid {INK.name()}; }}
+QSlider::handle:horizontal {{ width:10px; margin:-6px 0; background:{INK.name()}; }}
+QCheckBox::indicator {{ width:10px; height:10px; border:2px solid {INK.name()}; }}
+QCheckBox::indicator:checked {{ background:{INK.name()}; }}
+"""
+
+
+class StatusPanel(QWidget):
+    """设计图里的 FUNGI.EXE 窗口：头像、数值条、照顾按钮、INFO / FEED LOG / CONFIG"""
+
+    def __init__(self, colony: "Colony", widget: CreatureWidget):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.colony, self.widget, self.c = colony, widget, widget.c
+        self.drag_from: QPoint | None = None
+        self.setObjectName("panel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(PANEL_QSS)
+        self.setWindowTitle(f"FUNGI.EXE · {self.c.name}")
+
+        title = QLabel(f"FUNGI.EXE — {self.c.name}")
+        title.setObjectName("title")
+        close = QPushButton("×")
+        close.setObjectName("close")
+        close.clicked.connect(self.close)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(0)
+        bar.addWidget(title, 1)
+        bar.addWidget(close)
+
+        self.sprite = QLabel()
+        self.sprite.setFixedSize(84, 84)
+        self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sprite.setStyleSheet(f"border:2px solid {INK.name()};")
+        self.facts = QLabel()
+        head = QHBoxLayout()
+        head.addWidget(self.sprite)
+        head.addSpacing(6)
+        head.addWidget(self.facts, 1)
+
+        grid = QGridLayout()
+        grid.setVerticalSpacing(4)
+        self.bars: dict[str, tuple[PixelBar, QLabel]] = {}
+        for row, key in enumerate(("FULL", "ENERGY", "HAPPY", "GROWTH")):
+            grid.addWidget(QLabel(key), row, 0)
+            b, n = PixelBar(), QLabel()
+            grid.addWidget(b, row, 1)
+            grid.addWidget(n, row, 2)
+            self.bars[key] = (b, n)
+
+        self.feed_btn = QPushButton("喂食")
+        self.feed_btn.clicked.connect(lambda: colony.feed_dialog(self.widget, folder=False))
+        self.water_btn = QPushButton("浇水")
+        self.water_btn.clicked.connect(lambda: self.care("water"))
+        self.sun_btn = QPushButton("晒太阳")
+        self.sun_btn.clicked.connect(lambda: self.care("sun"))
+        buttons = QHBoxLayout()
+        for b in (self.feed_btn, self.water_btn, self.sun_btn):
+            buttons.addWidget(b)
+
+        self.tabs = QTabWidget()
+        self.info = QLabel()
+        self.info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.info.setWordWrap(True)
+        self.info.setContentsMargins(8, 8, 8, 8)
+        self.log = QListWidget()
+        self.tabs.addTab(self.info, "INFO")
+        self.tabs.addTab(self.log, "FEED LOG")
+        self.tabs.addTab(self.config_tab(), "CONFIG")
+
+        self.say = QLabel()
+        self.say.setWordWrap(True)
+        body = QVBoxLayout()
+        body.setContentsMargins(10, 8, 10, 10)
+        body.addLayout(head)
+        body.addLayout(grid)
+        body.addLayout(buttons)
+        body.addWidget(self.say)
+        body.addWidget(self.tabs, 1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(0)
+        outer.addLayout(bar)
+        outer.addLayout(body)
+        self.resize(330, 500)
+
+        self.log_size = -1
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(1000)
+
+    def slider(self, value: float, on_change) -> tuple[QSlider, QLabel]:
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(int(SPEED_RANGE[0] * 4), int(SPEED_RANGE[1] * 4))    # 每格 ×0.25
+        s.setValue(round(value * 4))
+        label = QLabel(f"×{value:.2f}")
+
+        def changed(v):
+            label.setText(f"×{v / 4:.2f}")
+            on_change(v / 4)
+        s.valueChanged.connect(changed)
+        return s, label
+
+    def config_tab(self) -> QWidget:
+        col = self.colony
+        page = QWidget()
+        form = QGridLayout(page)
+        self.growth_slider, g_label = self.slider(col.growth_speed, lambda v: col.set_config(growth_speed=v))
+        self.hunger_slider, h_label = self.slider(col.hunger_speed, lambda v: col.set_config(hunger_speed=v))
+        form.addWidget(QLabel("成长速度"), 0, 0)
+        form.addWidget(self.growth_slider, 0, 1)
+        form.addWidget(g_label, 0, 2)
+        form.addWidget(QLabel("饥饿速度"), 1, 0)
+        form.addWidget(self.hunger_slider, 1, 1)
+        form.addWidget(h_label, 1, 2)
+        self.shake_box = QCheckBox("吃大餐、长大时震一下")
+        self.shake_box.setChecked(col.shake)
+        self.shake_box.toggled.connect(lambda on: col.set_config(shake=on))
+        self.sound_box = QCheckBox("音效" + ("" if col.sound.available else "（找不到播放器）"))
+        self.sound_box.setChecked(col.sound.enabled)
+        self.sound_box.setEnabled(col.sound.available)
+        self.sound_box.toggled.connect(lambda on: col.set_config(sound=on))
+        self.devour_box = QCheckBox("吞噬文件（吃掉后" + ("进回收站）" if sys.platform == "win32" else "删除）"))
+        self.devour_box.setChecked(col.devour)
+        self.devour_box.toggled.connect(col.set_devour)
+        for i, b in enumerate((self.shake_box, self.sound_box, self.devour_box)):
+            form.addWidget(b, 2 + i, 0, 1, 3)
+        form.setRowStretch(5, 1)
+        return page
+
+    def care(self, kind: str):
+        self.say.setText(self.colony.care(self.c, kind))
+        self.refresh()
+
+    def cooldown(self, stamp: float) -> int:
+        return max(0, math.ceil((CARE_COOLDOWN / self.colony.passive_mult - (time.time() - stamp)) / 60))
+
+    def refresh(self):
+        c = self.c
+        if c not in self.colony.creatures or sip.isdeleted(self.widget):
+            self.close()
+            return
+        pm = art_pixmap(c.stage, spore_size(c.nutrition) if c.stage == 0 else 3,
+                        wither=c.mood in ("starving", "dormant"), mood=c.mood)
+        self.sprite.setPixmap(pm.scaled(76, 76, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+        box = self.widget.sprite_rect
+        self.facts.setText(f"NAME  {c.name}\nAGE   {fmt_age(time.time() - c.born)}\n"
+                           f"SIZE  {box.width() // PX}×{box.height() // PX}\nGEN   {c.gen}\n"
+                           f"{c.stage_name.upper()}  {MOOD_NAMES[c.mood]}")
+        lo, hi = c.stage_floor(), c.next_goal()
+        grow = 100 * max(0.0, min(1.0, (c.nutrition - lo) / max(1, hi - lo)))
+        for key, v in (("FULL", c.satiety / SATIETY_MAX * 100), ("ENERGY", c.energy), ("HAPPY", c.happiness),
+                       ("GROWTH", grow)):
+            b, n = self.bars[key]
+            b.set_value(v)
+            n.setText(f"{int(v)}%")
+        for btn, stamp, name in ((self.water_btn, c.watered, "浇水"), (self.sun_btn, c.sunned, "晒太阳")):
+            left = self.cooldown(stamp)
+            btn.setEnabled(left == 0)
+            btn.setText(name if left == 0 else f"{name} {left}m")
+        mat = self.colony.mat
+        cover = 100 * sum(1 for v in mat.d if v) / max(1, mat.n) if mat else 0.0
+        self.info.setText(f"阶段  {c.stage_name}（{int(c.nutrition)}/{hi}）\n"
+                          f"状态  {MOOD_CN[c.mood]}，{'有点困' if c.tired else '精神'}，"
+                          f"{ {'gloomy': '闷闷不乐', 'cheery': '很开心', 'plain': '心情平平'}[c.spirit] }\n"
+                          f"喂过  {c.feeds} 次　放出孢子 {c.released} 个\n"
+                          f"菌落  {len(self.colony.creatures)} 只　菌毯覆盖 {cover:.0f}%\n\n"
+                          f".txt .md 均衡　.log 精力+\n.poem 快乐+　.todo 成长+\n.secret ？？？")
+        if len(c.log) != self.log_size:
+            self.log_size = len(c.log)
+            self.log.clear()
+            for ts, label, value in reversed(c.log[-40:]):
+                self.log.addItem(f"{time.strftime('%m-%d %H:%M', time.localtime(ts))}  {label}  +{value}")
+            if not c.log:
+                self.log.addItem("（还没吃过东西）")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < 30:
+            self.drag_from = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self.drag_from is not None:
+            self.move(e.globalPosition().toPoint() - self.drag_from)
+
+    def mouseReleaseEvent(self, e):
+        self.drag_from = None
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        if self.colony.panels.get(self.c.id) is self:
+            self.colony.panels.pop(self.c.id)
+        super().closeEvent(e)
+
+
 # ───────────────────────────── 菌落（存档、生长、繁殖） ─────────────────────────────
 
 class Colony:
@@ -2088,6 +2447,9 @@ class Colony:
         self.last_tick = time.time()
         self.growth_speed = 1.0                           # 状态面板 CONFIG 里调
         self.hunger_speed = 1.0
+        self.shake = True
+        self.sound = Sound(data_dir / "sounds")
+        self.panels: dict[str, StatusPanel] = {}
         self.mat: Mycelium | None = None
         self.mat_layer = "top"
         self.mat_views: dict[str, MatStrip] = {}
@@ -2193,6 +2555,11 @@ class Colony:
             self.name_i = data.get("name_i", 0)
             self.on_top = data.get("on_top", True)
             self.devour = data.get("devour", DEVOUR)
+            cfg = data.get("config", {})
+            self.growth_speed = min(SPEED_RANGE[1], max(SPEED_RANGE[0], float(cfg.get("growth_speed", 1.0))))
+            self.hunger_speed = min(SPEED_RANGE[1], max(SPEED_RANGE[0], float(cfg.get("hunger_speed", 1.0))))
+            self.shake = bool(cfg.get("shake", True))
+            self.sound.enabled = bool(cfg.get("sound", True))
             self.mat_layer = data.get("mat_layer", "top")
             saved_mat = Mycelium.from_json(data.get("mat"))
             if saved_mat:
@@ -2228,6 +2595,8 @@ class Colony:
     def save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top, "devour": self.devour,
+                "config": {"growth_speed": self.growth_speed, "hunger_speed": self.hunger_speed, "shake": self.shake,
+                           "sound": self.sound.enabled},
                 "mat_layer": self.mat_layer, "mat": self.mat.to_json(), "mat_mark": self.mat_mark,
                 "chronicle": self.chronicle,
                 "patches": [asdict(p) for p in self.patches],
@@ -2442,6 +2811,7 @@ class Colony:
             return
         piece = self.pick_residue(widget.c.id)
         if piece:
+            self.sound.play("burp")
             self.show_bubble(widget, f"（嗝）……「{self.fragment(piece)}」。")
 
     def relation(self, me: Creature, other: Creature) -> str:
@@ -2732,6 +3102,11 @@ class Colony:
             return f"刚{'浇过水' if kind == 'water' else '晒过了'}，{max(1, math.ceil(left / 60))} 分钟后再来"
         setattr(c, stamp, now)
         setattr(c, attr, min(100.0, getattr(c, attr) + CARE_AMOUNT))
+        self.sound.play(kind)
+        w = self.widgets.get(c.id)
+        if w:
+            w.touch()
+            w.play("hop")
         self.save()
         return "咕嘟……精神了一点" if kind == "water" else "暖……伞面都松开了"
 
@@ -2928,6 +3303,7 @@ class Colony:
         shot = SporeShot(self, start, target or self.shot_target(start), outcome or self.pick_outcome())
         if not self.hidden_for_fullscreen:
             shot.show()
+            self.sound.play("spit")
         self.shots.append(shot)
         sp["shots"] += 1
         sp["shot_at"], sp["next_at"] = now, now + self.shot_gap()
@@ -3085,6 +3461,9 @@ class Colony:
 
         if eaten:
             widget.play("eat")
+            self.sound.play("eat")
+            if sum(v for v, _ in eaten) >= 15:
+                widget.jolt()
             widget.crumbs()
             if any(n == "已归档" for _, n in eaten):
                 QTimer.singleShot(900, lambda: widget.play("shake"))
@@ -3101,6 +3480,7 @@ class Colony:
                 widget.say("活过来了！", big=True)
         elif rejected:
             widget.play("shake")
+            self.sound.play("deny")
             widget.say(rejected[0])
         self.after_growth(widget, before)
         self.save()
@@ -3140,6 +3520,27 @@ class Colony:
         self.devour = on
         self.save()
 
+    def set_config(self, **kw):
+        for k, v in kw.items():
+            if k == "sound":
+                self.sound.enabled = v
+            else:
+                setattr(self, k, v)
+        self.save()
+
+    def open_panel(self, widget: CreatureWidget) -> "StatusPanel":
+        p = self.panels.get(widget.c.id)
+        if p is None or sip.isdeleted(p):
+            p = self.panels[widget.c.id] = StatusPanel(self, widget)
+            g = widget.frameGeometry()
+            screen = widget.screen().availableGeometry() if widget.screen() else QRect(0, 0, 1280, 720)
+            x = g.left() - p.width() - 8 if g.right() + p.width() + 8 > screen.right() else g.right() + 8
+            p.move(max(screen.left(), x), max(screen.top(), min(g.bottom() - p.height(), screen.bottom() - p.height())))
+        p.refresh()
+        p.show()
+        p.raise_()
+        return p
+
     def after_growth(self, widget: CreatureWidget, before: int, quiet: bool = False):
         c = widget.c
         if c.stage < before:
@@ -3152,6 +3553,8 @@ class Colony:
             self.log_event(f"{c.name} 长成了 {c.stage_name}")
             if not quiet:
                 widget.play("grow")
+                self.sound.play("grow")
+                QTimer.singleShot(900, widget.jolt)
                 widget.say(f"→ {c.stage_name}!", delay=0.9, big=True)
         due = c.spores_due()
         if due <= 0:
@@ -3176,6 +3579,7 @@ class Colony:
             child_w.fly(start, (tx, ty), delay=1.3 + i * 0.4)
         if released:
             widget.say(f"噗—— ×{released}", delay=1.1, big=True)
+            QTimer.singleShot(1100, lambda: self.sound.play("spores"))
             self.save()
 
     def find_spot(self, parent: Creature) -> tuple[int, int]:
@@ -3213,8 +3617,11 @@ class Colony:
         info(f"FOOD   {'█' * filled}{'░' * (10 - filled)} {int(c.nutrition)}/{hi}")
         full = round(10 * c.satiety / SATIETY_MAX)
         info(f"FULL   {'█' * full}{'░' * (10 - full)} {int(c.satiety)}%  {MOOD_NAMES[c.mood]}")
+        for label, v in (("ENERGY", c.energy), ("HAPPY", c.happiness)):
+            info(f"{label:<6} {'█' * round(v / 10)}{'░' * (10 - round(v / 10))} {int(v)}%")
         info(f"FEEDS  {c.feeds}   SPORES {c.released}")
         m.addSeparator()
+        m.addAction("状态面板…", lambda: self.open_panel(widget))
         m.addAction("聊天…（双击也行）", lambda: self.open_chat(widget))
         log_menu = m.addMenu("最近吃的")
         log_menu.setStyleSheet(MENU_QSS)
@@ -3247,7 +3654,8 @@ class Colony:
             d = QFileDialog.getExistingDirectory(None, "喂一个文件夹", str(Path.home()))
             paths = [Path(d)] if d else []
         else:
-            files, _ = QFileDialog.getOpenFileNames(None, "喂点文字", str(Path.home()), "文字 (*.txt *.md);;全部文件 (*)")
+            pattern = " ".join(f"*{e}" for e in FOOD_KINDS)
+            files, _ = QFileDialog.getOpenFileNames(None, "喂点文字", str(Path.home()), f"文字 ({pattern});;全部文件 (*)")
             paths = [Path(f) for f in files]
         if paths:
             self.feed(widget, paths)
@@ -3276,6 +3684,8 @@ class Colony:
             return
         self.creatures.remove(c)
         self.widgets.pop(c.id).close()
+        if c.id in self.panels:
+            self.panels.pop(c.id).close()
         self.log_event(f"{c.name} 被放生，离开了桌面")
         if self.memory.pop(c.id, None) is not None:
             self.save_memory()

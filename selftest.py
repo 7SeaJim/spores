@@ -27,6 +27,9 @@ REAL_COOLDOWN = F.CHAT_COOLDOWN
 FRESH = __import__("itertools").cycle([      # 假模型：每次回一句不一样的话，免得被当成复读
     "那团还没放够，先不碰。", "菌毯边上有点潮，我们在等。", "刚才那个词还蹲在左边。", "喷孢菌又鼓起来一小下。",
     "这层回收站闻着像雨后。", "我们先在缓存里趴一会儿。", "桌面右上角那片还很干。", "底下那根菌丝换了个方向。"])
+PLAYED = []
+F.Sound.spawn = lambda self, path: PLAYED.append(path.name.split(".")[0])   # 自测不真的出声
+F.find_player = lambda: ["test-player"]
 F.CHAT_COOLDOWN = 0          # 前面各节会对同一只菌连发几句；第 20 节专门测冷却
 
 app = QApplication([])
@@ -70,6 +73,8 @@ def shutdown(colony):
         w.timer.stop()
         w.close()
     colony.spitter_timer.stop()
+    for p in list(colony.panels.values()):
+        p.close()
     colony.fullscreen_timer.stop()
     colony.screen_debounce.stop()
     for s in colony.shots:
@@ -1350,6 +1355,87 @@ save_old.mkdir()
 colony25c = F.Colony(save_old)
 check("老存档没有精力、快乐字段也能读", colony25c.creatures and colony25c.creatures[0].energy > 0)
 shutdown(colony25c)
+
+print("24. 状态面板、音效、震动")
+colony26 = F.Colony(root / "save26")
+c26 = colony26.creatures[0]
+w26 = colony26.widgets[c26.id]
+c26.nutrition, c26.satiety, c26.energy, c26.happiness = F.STAGES[F.ADULT][1] + 1, 50, 70, 30
+colony26.after_growth(w26, 0)
+p26 = colony26.open_panel(w26)
+check("状态面板打开，同一只再开不重复", colony26.open_panel(w26) is p26 and len(colony26.panels) == 1)
+check("面板四条数值条对上", [p26.bars[k][0].value for k in ("FULL", "ENERGY", "HAPPY")] == [50, 70, 30]
+      and p26.bars["HAPPY"][0].lit() == math.ceil(30 / 100 * F.PixelBar.CELLS))
+check("面板写着名字、代数、尺寸", c26.name in p26.facts.text() and "GEN" in p26.facts.text() and "SIZE" in p26.facts.text())
+check("三个页签 INFO / FEED LOG / CONFIG", [p26.tabs.tabText(i) for i in range(3)] == ["INFO", "FEED LOG", "CONFIG"])
+food26 = root / "food26.poem"
+food26.write_text("风吹过的时候\n" * 20, encoding="utf-8")
+os.utime(food26, (time.time() - 3600,) * 2)
+PLAYED.clear()
+colony26.feed(w26, [food26])
+p26.refresh()
+check("喂完 FEED LOG 多一行", "food26.poem" in p26.log.item(0).text(), p26.log.item(0).text())
+check("吃东西有咀嚼声", "eat" in PLAYED, PLAYED)
+p26.water_btn.click()
+check("点浇水：精力涨、按钮进冷却、有声音", c26.energy > 70 and not p26.water_btn.isEnabled() and "m" in p26.water_btn.text()
+      and "water" in PLAYED, (c26.energy, p26.water_btn.text(), PLAYED))
+p26.sun_btn.click()
+check("点晒太阳：快乐涨", c26.happiness >= 30 + F.CARE_AMOUNT and "sun" in PLAYED)
+p26.growth_slider.setValue(8)
+p26.hunger_slider.setValue(2)
+check("CONFIG 滑块改成长 ×2、饥饿 ×0.5", colony26.growth_speed == 2.0 and colony26.hunger_speed == 0.5)
+c26.nutrition, c26.satiety = 5, 50
+before26 = (c26.nutrition, c26.satiety)
+colony26.metabolize(c26, 3600)
+fast_gain, slow_hunger = c26.nutrition - before26[0], before26[1] - c26.satiety
+colony26.growth_speed = colony26.hunger_speed = 1.0
+c26.nutrition, c26.satiety = 5, 50
+colony26.metabolize(c26, 3600)
+check("成长、饥饿速度真的生效", abs(fast_gain - 2 * (c26.nutrition - 5)) < 1e-6 and abs(slow_hunger - (50 - c26.satiety) / 2) < 1e-6)
+colony26.growth_speed, colony26.hunger_speed = 2.0, 0.5
+p26.sound_box.setChecked(False)
+PLAYED.clear()
+colony26.care(c26, "water")
+check("关掉音效就不出声", not PLAYED and not colony26.sound.enabled)
+p26.sound_box.setChecked(True)
+p26.shake_box.setChecked(False)
+w26.jolt()
+check("关掉震动就不震", w26.jolt_until == 0)
+p26.shake_box.setChecked(True)
+wait(0.5)
+w26.place()
+x0 = w26.x()
+w26.jolt(0.5)
+moved = set()
+for _ in range(6):
+    wait(0.05)
+    moved.add(w26.x())
+wait(0.6)
+check("震动：窗口左右抖完回原位", len(moved) > 1 and w26.x() == x0, (sorted(moved), x0, w26.x()))
+colony26.save()
+out_dir.mkdir(parents=True, exist_ok=True)
+for i, name in enumerate(("info", "log", "config")):
+    p26.tabs.setCurrentIndex(i)
+    p26.grab().save(str(out_dir / f"panel_{name}.png"))
+p26.close()
+check("关面板从列表里移除", not colony26.panels)
+shutdown(colony26)
+colony26b = F.Colony(root / "save26")
+check("设置存档读回", (colony26b.growth_speed, colony26b.hunger_speed, colony26b.shake, colony26b.sound.enabled) == (2.0, 0.5, True, True))
+shutdown(colony26b)
+snd = F.Sound(root / "snd")
+wav = snd.path("burp")
+import wave as _wave
+with _wave.open(str(wav)) as wf:
+    check("合成的 WAV 能读：单声道 16 位、长度合理", wf.getnchannels() == 1 and wf.getsampwidth() == 2
+          and 0.1 < wf.getnframes() / wf.getframerate() < 1.0)
+check("所有音效都能合成", all(snd.path(n).stat().st_size > 1000 for n in F.SOUND_RECIPES))
+PLAYED.clear()
+snd.play("poke")
+snd.play("poke")
+check("同一个声音连点不叠", PLAYED == ["poke"], PLAYED)
+snd.player = None
+check("没有播放器：安静跳过", snd.play("eat") is False)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
