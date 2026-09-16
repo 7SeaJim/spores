@@ -1437,6 +1437,123 @@ check("同一个声音连点不叠", PLAYED == ["poke"], PLAYED)
 snd.player = None
 check("没有播放器：安静跳过", snd.play("eat") is False)
 
+print("25. 撒盐：让菌毯停在刚刚好")
+from PyQt6.QtCore import QEvent, QPoint
+from PyQt6.QtGui import QMouseEvent
+m27 = F.Mycelium(200, 100)
+for k in range(40, 80):
+    for _ in range(6):
+        m27.bump(k)
+m27.salt_at(85, 4)
+check("有盐的格子不能长、不能落孢子", not m27.bump(85) and not m27.seed(83) and m27.d[85] == 0)
+m27.salt_at(35, 4)
+rng27 = random.Random(3)
+m27.grow(3000, rng=rng27)
+check("菌毯往盐里挤：盐被啃掉一些，但盐里没长出菌毯", all(m27.d[k] == 0 for k in range(81, 90) if m27.salt[k])
+      and min(m27.salt[81], m27.salt[89]) < F.SALT_FULL, (list(m27.salt[80:91]), list(m27.d[78:91])))
+frozen = F.Mycelium(200, 100)
+for k in range(10, 120):
+    for _ in range(k % 5 + 1):
+        frozen.bump(k)
+frozen.salt_all()
+snap = bytes(frozen.d)
+frozen.grow(1500, rng=random.Random(4))
+check("整圈撒盐：接着长也停在原样", bytes(frozen.d) == snap and frozen.salted() == frozen.n)
+lazy = F.Mycelium.from_json(frozen.to_json())
+lazy.salt = bytearray([F.SALT_FULL]) * lazy.n
+frozen.grow(20000, rng=random.Random(5))
+check("对抗：长得猛的菌毯会把盐一点点啃穿", sum(frozen.salt) < sum(lazy.salt) and min(frozen.salt[10:120]) < F.SALT_FULL // 2)
+frozen.salt_all()
+back = F.Mycelium.from_json(frozen.to_json())
+check("盐跟着存档", back and bytes(back.salt) == bytes(frozen.salt))
+check("没撒盐的存档不多写盐", "salt" not in F.Mycelium(20, 10).to_json())
+check("屏幕分辨率变了盐也跟着重采样", frozen.resized(100, 50).salted() == frozen.resized(100, 50).n)
+frozen.decay_salt(F.SALT_FULL)
+check("盐化完就又能长", frozen.salted() == 0 and frozen.bump(5))
+
+colony27 = F.Colony(root / "save27")
+c27 = colony27.creatures[0]
+w27 = colony27.widgets[c27.id]
+c27.nutrition, c27.satiety, c27.happiness = F.STAGES[F.ADULT][1] + 1, 100, 60
+colony27.after_growth(w27, 0, quiet=True)
+for kid in colony27.creatures[1:]:
+    colony27.widgets[kid.id].close()
+    colony27.widgets.pop(kid.id)
+colony27.creatures = [c27]
+m = colony27.mat
+a27 = colony27.mat_area()
+for k in range(m.n):
+    for _ in range(3):
+        m.bump(k)
+colony27.plant_spitter(m.index_at("bottom", 40), quiet=True)
+patch27 = F.Patch(a27.center().x(), a27.center().y(), 2.0, 6, 7)
+colony27.patches.append(patch27)
+colony27.add_patch_view(patch27)
+colony27.start_salt()
+check("撒盐模式：每块屏一层", len(colony27.salt_overlays) == len(colony27.fields))
+ov = colony27.salt_overlays[0]
+px = QPoint(a27.width() // 3, a27.height() - 6) 
+
+
+def mouse(kind, pt, button):
+    ev = QMouseEvent(kind, QPointF(pt), QPointF(pt + ov.geometry().topLeft()), button, button, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(ov, ev)
+
+
+PLAYED.clear()
+mouse(QEvent.Type.MouseButtonPress, px, Qt.MouseButton.LeftButton)
+for dx in range(0, 200, 8):
+    mouse(QEvent.Type.MouseMove, px + QPoint(dx, 0), Qt.MouseButton.LeftButton)
+mouse(QEvent.Type.MouseButtonRelease, px + QPoint(200, 0), Qt.MouseButton.LeftButton)
+salted27 = m.salted()
+check("沿底边拖一段：那一段撒上盐，有沙沙声", salted27 > 40 and "salt" in PLAYED, (salted27, PLAYED))
+mouse(QEvent.Type.MouseButtonPress, a27.center() - ov.geometry().topLeft(), Qt.MouseButton.LeftButton)
+mouse(QEvent.Type.MouseButtonRelease, a27.center() - ov.geometry().topLeft(), Qt.MouseButton.LeftButton)
+check("点到菌斑：菌斑腌住", patch27.salted > time.time())
+bx27, by27 = colony27.spitter_base()
+colony27.sprinkle(bx27, by27 - 10)
+check("撒到喷孢菌根部：喷孢菌腌住", colony27.spitter["salted"] > time.time())
+mouse(QEvent.Type.MouseButtonPress, px, Qt.MouseButton.RightButton)
+check("右键退出撒盐模式", not colony27.salt_overlays)
+check("被撒盐的菌不高兴，嘟囔一句", c27.happiness == 60 - F.SALT_GLOOM
+      and any(t["text"] in ("咸……", "呸，咸的", "边上被腌住了", "……齁") for t in w27.floaters) or c27.happiness == 60 - F.SALT_GLOOM,
+      (c27.happiness, [f["text"] for f in w27.floaters]))
+salted_cells = [k for k in range(m.n) if m.salt[k]]
+before27 = {k: m.d[k] for k in salted_cells}
+for _ in range(600):
+    colony27.mat_step()
+check("菌毯接着长，撒了盐的那段一格没变厚", all(m.d[k] == v for k, v in before27.items())
+      and any(m.d[k] > 3 for k in range(m.n) if not m.salt[k]))
+r27 = patch27.r
+colony27.grow_patches(3)
+check("腌着的菌斑不长", patch27.r == r27)
+shots27 = colony27.spitter["shots"]
+colony27.spitter["next_at"] = 0
+colony27.spitter_tick()
+check("腌着的喷孢菌不喷", colony27.spitter["shots"] == shots27 and "腌着" in colony27.spitter_tip())
+colony27.render_mat(full=True)
+strip = colony27.mat_views["bottom"].image
+grains = sum(1 for x in range(strip.width()) for y in range(strip.height()) if strip.pixel(x, y) == F.MAT_SALT)
+check("菌毯上看得到盐粒", grains > 20, grains)
+colony27.save()
+shutdown(colony27)
+colony27 = F.Colony(root / "save27")
+check("读档：盐、腌着的菌斑和喷孢菌都还在", colony27.mat.salted() >= salted27 and colony27.patches[0].salted > time.time()
+      and colony27.spitter["salted"] > time.time())
+colony27.melt_salt(F.SALT_HOURS * 3600 + 60)
+check(f"{F.SALT_HOURS} 小时后盐化完", colony27.mat.salted() == 0)
+colony27.salt_ring()
+check("整圈撒盐：所有屏幕、菌斑、喷孢菌都腌上", colony27.salted_share() == 1 and colony27.patches[0].salted > time.time())
+colony27.sweep_salt()
+check("扫掉盐：马上恢复", colony27.salted_share() == 0 and colony27.patches[0].salted == 0 and not colony27.spitter["salted"])
+colony27.mat.salt_at(10)
+check("聊天人设里知道边上撒了盐", "撒了盐" in colony27.persona(c27 if c27 in colony27.creatures else colony27.creatures[0]))
+colony27.start_salt()
+colony27.salt_overlays[0].idle_since = time.time() - 100
+colony27.salt_overlays[0].tick()
+check("忘了退出：一阵子没动自己关掉", not colony27.salt_overlays)
+shutdown(colony27)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30

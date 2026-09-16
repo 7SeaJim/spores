@@ -46,7 +46,7 @@ except ImportError:                      # Windows
 
 from PyQt6 import sip
 from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (QAction, QActionGroup, QColor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QTransform, QFont, QFontMetrics, QGuiApplication, QIcon,
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                              QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu, QMessageBox, QPushButton,
@@ -124,6 +124,13 @@ HUNGRY_AT = 30             # 饱腹低于这个就是「饿」：生长减半，
 SATIETY_PER_FOOD = 4       # 每 1 营养加多少饱腹
 STARVE_LOSS = 6            # 饿扁（饱腹 0）后每小时掉多少营养
 OFFLINE_STARVE_CAP = 36    # 关闭程序期间最多饿掉多少营养
+# 撒盐：让菌毯停在现在的样子
+SALT_FULL = 255            # 一格盐满的时候的量
+SALT_HOURS = 24            # 盐自己慢慢化掉要多少小时
+SALT_BITE = 3              # 菌毯往撒了盐的格子里挤一次，啃掉多少盐（越旺盛的菌落啃得越快）
+SALT_RADIUS = 5            # 撒一下盖住左右几格
+SALT_REACH = MAT_STRIP + 4 # 离屏幕边多少格以内算撒在边缘菌毯上
+SALT_GLOOM = 4             # 被撒盐时它们掉多少快乐
 MAT_RECEDE = 0.3           # 全体饿扁时，边缘菌毯每次（MAT_TICK）退缩几步
 MOOD_NAMES = {"full": "", "hungry": "饿", "starving": "饿扁了", "dormant": "休眠"}
 
@@ -1495,6 +1502,7 @@ class Mycelium:
         for i, v in enumerate(self.d):
             self.d[i] = min(v, MAT_MAX)
         self.active = [i for i, v in enumerate(self.d) if v]
+        self.salt = bytearray(self.n)                     # 每格还剩多少盐：有盐的格子长不动
         self.dirty: set[int] = set()
         self._eff: dict[int, float] = {}
         self._sprout: dict[int, tuple | None] = {}
@@ -1529,7 +1537,7 @@ class Mycelium:
     # ── 生长 ──
     def bump(self, i: int) -> bool:
         i %= self.n
-        if self.d[i] >= MAT_MAX:
+        if self.d[i] >= MAT_MAX or self.salt[i]:
             return False
         if not self.d[i]:
             self.active.append(i)
@@ -1561,9 +1569,53 @@ class Mycelium:
                 i = rng.choice(self.active)
             j = (i + rng.choice((-1, 1)) * rng.choice((1, 1, 1, 2))) % n
             if d[j] + 1 < d[i]:
-                self.bump(j)
+                if self.salt[j]:
+                    self.bite(j, SALT_BITE)                # 往盐里挤：啃掉一点盐
+                else:
+                    self.bump(j)
             elif rng.random() < 1 - d[i] / MAT_MAX:
-                self.bump(i)
+                if self.salt[i]:
+                    self.bite(i, 1)
+                else:
+                    self.bump(i)
+
+    # ── 盐 ──
+    def bite(self, i: int, amount: int):
+        i %= self.n
+        before = self.salt[i]
+        self.salt[i] = max(0, before - amount)
+        if before and not self.salt[i]:
+            self.dirty.update(j % self.n for j in range(i - 1, i + 2))
+
+    def salt_at(self, i: int, radius: int = SALT_RADIUS) -> int:
+        """以 i 为中心左右 radius 格撒满盐，返回新撒上（或补满）的格数"""
+        added = 0
+        for j in range(i - radius, i + radius + 1):
+            k = j % self.n
+            if self.salt[k] < SALT_FULL:
+                added += 1
+                self.salt[k] = SALT_FULL
+                self.dirty.add(k)
+        return added
+
+    def salt_all(self) -> int:
+        return self.salt_at(0, self.n)
+
+    def salted(self) -> int:
+        return sum(1 for v in self.salt if v)
+
+    def decay_salt(self, amount: int):
+        if amount <= 0:
+            return
+        for k, v in enumerate(self.salt):
+            if v:
+                self.salt[k] = max(0, v - amount)
+                if not self.salt[k] or v // 64 != self.salt[k] // 64:
+                    self.dirty.add(k)
+
+    def clear_salt(self):
+        self.dirty.update(k for k, v in enumerate(self.salt) if v)
+        self.salt = bytearray(self.n)
 
     def shrink(self, steps: int, rng=random):
         """菌毯退缩：优先从比邻格厚的地方（前沿、凸起）往回收"""
@@ -1661,18 +1713,25 @@ class Mycelium:
             edge, pos = new.edge_of(i)
             old = min(self.edge_len(edge) - 1, pos * self.edge_len(edge) // new.edge_len(edge))
             new.d[i] = self.d[self.index_at(edge, old)]
+            new.salt[i] = self.salt[self.index_at(edge, old)]
         new.active = [i for i, v in enumerate(new.d) if v]
         return new
 
     def to_json(self) -> dict:
-        return {"cols": self.cols, "rows": self.rows, "depth": base64.b64encode(bytes(self.d)).decode()}
+        data = {"cols": self.cols, "rows": self.rows, "depth": base64.b64encode(bytes(self.d)).decode()}
+        if any(self.salt):
+            data["salt"] = base64.b64encode(bytes(self.salt)).decode()
+        return data
 
     @classmethod
     def from_json(cls, data) -> "Mycelium | None":
         try:
             m = cls(int(data["cols"]), int(data["rows"]), base64.b64decode(data["depth"]))
-        except (TypeError, KeyError, ValueError):
+            salt = base64.b64decode(data["salt"]) if data.get("salt") else b""
+        except (TypeError, KeyError, ValueError, AttributeError):
             return None
+        if len(salt) == m.n:
+            m.salt = bytearray(salt)
         return m if len(m.d) == m.n else None
 
 
@@ -1709,6 +1768,7 @@ class MatField:
 
 
 MAT_INK, MAT_DUST, MAT_PAPER, MAT_HALO = 0xFF111111, 0xFF55524C, 0xFFFAF9F4, 0xC8FAF9F4
+MAT_SALT = 0xFFE4E0D2
 SPROUT_NAMES = ("mat_sprout", "mat_sprout_b", "mat_sprout_c", "mat_sprout_d")
 SPROUT_REACH = 5           # 小蘑菇（含描边）左右最多伸出几列
 
@@ -1789,8 +1849,18 @@ class MatStrip(QWidget):
                 if (j + off) % n == i:
                     hairs[k] = MAT_INK if t == len(cells) - 1 else MAT_DUST
         empty = not (D or side or sprouts or hairs)
+        salt = m.salt[i]
+        top = math.ceil(D)
         for k in range(MAT_STRIP):
             argb = 0 if empty else mat_cell(i, k, D, side, sprouts, hairs)
+            if salt:                                        # 盐粒：菌毯表面外一圈白点，菌毯里零星几粒，盐越少越稀
+                h = _hash(i * 131 + k, 4099) % 1024
+                if k == top and h < salt * 4:                   # 表面一层盐壳：白、灰相间，深浅背景都看得见
+                    argb = MAT_SALT if (i + h) % 3 else MAT_DUST
+                elif k == top + 1 and h < salt * 3 // 2:
+                    argb = MAT_SALT if h % 2 else MAT_DUST
+                elif k < top and argb and h < salt:
+                    argb = MAT_SALT
             if edge == "top":
                 img.setPixel(pos, k, argb)
             elif edge == "bottom":
@@ -1856,7 +1926,7 @@ class SpitterWidget(QWidget):
         age = now - sp["born"]
         reveal = int(22 * age / 2.5) if age < 2.5 else 99
         shake = (0, 0)
-        starving = self.colony.starving()
+        starving = self.colony.starving() or sp.get("salted", 0) > now    # 饿扁或被腌着：蔫着不喷
         if now - sp.get("shot_at", 0) < 0.35:
             frame = "shoot"
         elif sp["next_at"] - now < 0.8 and not starving:
@@ -1987,6 +2057,7 @@ class Patch:
     r: float = 1.0
     max: int = 5
     seed: int = 0
+    salted: float = 0.0                                   # 撒了盐：到这个时间之前不长
 
     @classmethod
     def from_dict(cls, d: dict) -> "Patch":
@@ -2042,7 +2113,8 @@ class PatchView(QWidget):
         self.render()
 
     def render(self):
-        step = int(self.patch.r * 4)
+        salted = self.patch.salted > time.time()
+        step = (int(self.patch.r * 4), salted)
         if step == self.shown_r:
             return
         self.shown_r = step
@@ -2050,6 +2122,8 @@ class PatchView(QWidget):
         for u in range(-PATCH_HALF, PATCH_HALF + 1):
             for v in range(-PATCH_HALF, PATCH_HALF + 1):
                 argb = patch_cell(self.patch, u, v)
+                if salted and argb in (MAT_INK, MAT_DUST) and _hash(u * 131 + v, 4099) % 5 == 0:
+                    argb = MAT_SALT
                 if argb:
                     self.image.setPixel(u + PATCH_HALF, v + PATCH_HALF, argb)
         self.update()
@@ -2058,6 +2132,118 @@ class PatchView(QWidget):
         p = QPainter(self)
         p.drawImage(self.rect(), self.image)
         p.end()
+
+
+# ───────────────────────────── 撒盐模式 ─────────────────────────────
+
+SALT_SHAKER = ["..####..",
+               ".#o#o##.",
+               ".######.",
+               "#oooooo#",
+               "#o####o#",
+               "#oooooo#",
+               "#oooooo#",
+               ".######."]
+
+
+@lru_cache(maxsize=1)
+def salt_cursor() -> QCursor:
+    img = paint_rows(add_halo(SALT_SHAKER), {"#": INK, "o": PAPER, HALO: PAPER})
+    return QCursor(QPixmap.fromImage(img), img.width() // 2, 0)
+
+
+class SaltOverlay(QWidget):
+    """撒盐模式时盖住一块屏幕：按住拖动撒盐，右键 / Esc 退出"""
+
+    def __init__(self, colony: "Colony", field: MatField):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
+                         | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("fungi · salt")
+        self.colony, self.field = colony, field
+        self.setGeometry(field.rect)
+        self.setCursor(salt_cursor())
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.pressing = False
+        self.last_at: QPoint | None = None
+        self.grains: list[dict] = []
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(33)
+        self.idle_since = time.time()
+
+    def tick(self):
+        now = time.time()
+        self.grains = [g for g in self.grains if now - g["t0"] < 0.5]
+        if now - self.idle_since > 90:                     # 忘了退出：一分半没动静自己关
+            self.colony.end_salt()
+            return
+        self.update()
+
+    def shake_at(self, local: QPoint):
+        self.idle_since = time.time()
+        g = local + self.geometry().topLeft()
+        if self.last_at is not None and (local - self.last_at).manhattanLength() < PX * 3:
+            return
+        self.last_at = local
+        self.colony.sprinkle(g.x(), g.y())
+        now = time.time()
+        for _ in range(6):
+            self.grains.append({"x": local.x() + random.uniform(-14, 14), "y": local.y() + random.uniform(4, 12),
+                                "vy": random.uniform(40, 120), "t0": now})
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self.colony.end_salt()
+            return
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.pressing = True
+            self.last_at = None
+            self.shake_at(e.position().toPoint())
+
+    def mouseMoveEvent(self, e):
+        if self.pressing:
+            self.shake_at(e.position().toPoint())
+
+    def mouseReleaseEvent(self, e):
+        self.pressing = False
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.colony.end_salt()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(17, 17, 17, 40))       # 淡淡压暗一层（全透明的地方点不到）
+        reach = SALT_REACH * PX
+        band = QColor(250, 249, 244, 46)
+        r = self.rect()
+        for rect in (QRect(0, 0, r.width(), reach), QRect(0, r.height() - reach, r.width(), reach),
+                     QRect(0, reach, reach, r.height() - 2 * reach), QRect(r.width() - reach, reach, reach, r.height() - 2 * reach)):
+            p.fillRect(rect, band)
+        now = time.time()
+        for g in self.grains:
+            t = now - g["t0"]
+            x, y = int(g["x"]) // 2 * 2, int(g["y"] + g["vy"] * t) // 2 * 2
+            p.fillRect(x - 1, y - 1, 4, 4, INK)
+            p.fillRect(x, y, 2, 2, PAPER)
+        if self.field.key == self.colony.primary_key:
+            text = "撒盐：按住沿屏幕边拖，撒到的地方停住不长（菌斑、喷孢菌也行） · 右键 / Esc 退出"
+            font = ui_font(13)
+            fm = QFontMetrics(font)
+            w, h = fm.horizontalAdvance(text) + 28, 30
+            box = QRect((r.width() - w) // 2, reach + 16, w, h)
+            p.fillRect(box, INK)
+            p.fillRect(box.adjusted(2, 2, -2, -2), PAPER)
+            p.setFont(font)
+            p.setPen(INK)
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        super().closeEvent(e)
 
 
 # ───────────────────────────── 聊天界面 ─────────────────────────────
@@ -2434,7 +2620,8 @@ class StatusPanel(QWidget):
                           f"状态  {MOOD_CN[c.mood]}，{'有点困' if c.tired else '精神'}，"
                           f"{ {'gloomy': '闷闷不乐', 'cheery': '很开心', 'plain': '心情平平'}[c.spirit] }\n"
                           f"喂过  {c.feeds} 次　放出孢子 {c.released} 个\n"
-                          f"菌落  {len(self.colony.creatures)} 只　菌毯覆盖 {cover:.0f}%\n\n"
+                          f"菌落  {len(self.colony.creatures)} 只　菌毯覆盖 {cover:.0f}%"
+                          + (f"　盐 {self.colony.salted_share() * 100:.0f}%" if self.colony.salted_share() else "") + "\n\n"
                           f".txt .md 均衡　.log 精力+\n.poem 快乐+　.todo 成长+\n.secret ？？？")
         if len(c.log) != self.log_size:
             self.log_size = len(c.log)
@@ -2487,6 +2674,9 @@ class Colony:
         self.watched_screens: set[int] = set()
         self.mat_layer = "top"
         self.mat_acc = 0.0
+        self.salt_acc = 0.0
+        self.salt_overlays: list[SaltOverlay] = []
+        self.salt_session: set[str] = set()               # 这次撒盐撒到了哪几块屏
         self.offline_elapsed = 0.0
         self.spitter: dict | None = None
         self.spitter_view: SpitterWidget | None = None
@@ -2607,6 +2797,7 @@ class Colony:
                 pos = min(length - 1, max(0, int(sp.get("frac", 0.5) * length)))
                 self.spitter = {"i": m.index_at(sp["edge"], pos), "edge": sp["edge"], "frac": sp.get("frac", 0.5), "screen": key,
                                 "born": sp.get("born", time.time()) - 99, "shots": sp.get("shots", 0),
+                                "salted": sp.get("salted", 0.0),
                                 "stats": {k: sp.get("stats", {}).get(k, 0) for k in OUTCOME_NAMES},
                                 "next_at": time.time() + max(3.0, sp.get("next_in", 30) / self.passive_mult)}
             self.creatures = [Creature.from_dict(d) for d in data.get("creatures", [])]
@@ -2638,7 +2829,8 @@ class Colony:
                 "mat_mark": self.mat_mark,
                 "chronicle": self.chronicle,
                 "patches": [asdict(p) for p in self.patches],
-                "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats", "screen")}
+                "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats", "screen") if k in self.spitter}
+                            | {"salted": self.spitter.get("salted", 0.0)}
                             | {"next_in": max(0.0, self.spitter["next_at"] - time.time()) * self.passive_mult})
                 if self.spitter else None,
                 "creatures": [asdict(c) for c in self.creatures]}
@@ -2666,6 +2858,7 @@ class Colony:
                 self.after_growth(self.widgets[c.id], before)
         self.track_moods()
         self.mat_acc += dt * self.passive_mult
+        self.melt_salt(dt * self.passive_mult)
         while self.mat_acc >= MAT_TICK:
             self.mat_acc -= MAT_TICK
             self.mat_step()
@@ -3034,6 +3227,8 @@ class Colony:
         others = [f"- {o.name}：{self.relation(c, o)}，{STAGE_CN[o.stage_name]}，{MOOD_CN[o.mood]}，{self.where(c, o)}"
                   for o in self.creatures if o is not c]
         world = ["菌毯沿着屏幕边上" + self.ring_words(self.mat_occupied())]
+        if self.salted_share():
+            world.append("有一段边被人撒了盐，那里咸，长不动")
         if self.spitter:
             world.append("菌毯上长着一只不会动的喷孢菌，隔一阵就往外喷孢子，大多散掉了")
         if self.patches:
@@ -3248,6 +3443,7 @@ class Colony:
             self.spitter_view.place()
 
     def grow_mat_offline(self, elapsed: float):
+        self.melt_salt(elapsed * self.passive_mult)
         steps = elapsed * self.passive_mult / MAT_TICK
         if steps < 1:
             return
@@ -3305,8 +3501,9 @@ class Colony:
             w.raise_()
 
     def grow_patches(self, amount: float):
+        now = time.time()
         for p in self.patches:
-            if p.r < p.max:
+            if p.r < p.max and p.salted <= now:
                 p.r = min(p.max, p.r + amount)
                 if id(p) in self.patch_views:
                     self.patch_views[id(p)].render()
@@ -3325,6 +3522,8 @@ class Colony:
         hit = next((p for p in self.patches if math.hypot(p.x - x, p.y - y) < (p.r + 2) * PX), None)
         if hit is None and len(self.patches) >= MAX_PATCHES:
             hit = random.choice(self.patches)
+        if hit and hit.salted > time.time():               # 腌着的菌斑：孢子落上去也长不起来
+            return
         if hit:
             hit.max = min(PATCH_MAX[1] + 2, hit.max + 1)
             hit.r = min(hit.max, hit.r + 1)
@@ -3335,6 +3534,111 @@ class Colony:
         self.patches.append(p)
         self.log_event("喷孢菌的孢子在桌面中间长出了一块菌斑")
         self.add_patch_view(p)
+
+    # ── 撒盐 ──
+    def melt_salt(self, seconds: float):
+        """盐自己慢慢化（SALT_HOURS 小时化完）"""
+        if not any(any(f.mat.salt) for f in self.fields.values()):
+            self.salt_acc = 0.0
+            return
+        self.salt_acc += seconds / 3600 * SALT_FULL / SALT_HOURS
+        units = int(self.salt_acc)
+        if units:
+            self.salt_acc -= units
+            for f in self.fields.values():
+                f.mat.decay_salt(units)
+
+    def salted_share(self) -> float:
+        cells = sum(f.mat.n for f in self.fields.values())
+        return sum(f.mat.salted() for f in self.fields.values()) / max(1, cells)
+
+    def salt_until(self) -> float:
+        return time.time() + SALT_HOURS * 3600 / self.passive_mult
+
+    def sprinkle(self, x: float, y: float) -> int:
+        """在屏幕坐标 (x, y) 撒一把盐：贴边就腌边缘菌毯，点到菌斑、喷孢菌根部就腌它们。返回腌到了几处。"""
+        f = self.field_at(x, y)
+        a, m = f.rect, f.mat
+        cx, cy = (x - a.x()) / PX, (y - a.y()) / PX
+        hits = 0
+        if min(cx, cy, m.cols - 1 - cx, m.rows - 1 - cy) <= SALT_REACH:
+            hits += m.salt_at(m.nearest(cx, cy)) > 0
+            self.render_mat()
+        for p in self.patches:
+            if math.hypot(p.x - x, p.y - y) < (p.r * 1.3 + 3) * PX and p.salted <= time.time():
+                p.salted = self.salt_until()
+                hits += 1
+                if id(p) in self.patch_views:
+                    self.patch_views[id(p)].render()
+        if self.spitter and self.spitter.get("salted", 0) <= time.time() and math.dist(self.spitter_base(), (x, y)) < 14 * PX:
+            self.spitter["salted"] = self.salt_until()
+            hits += 1
+            if self.spitter_view:
+                self.spitter_view.update()
+        if hits:
+            self.salt_session.add(f.key)
+            self.sound.play("salt")
+        return hits
+
+    def start_salt(self):
+        """进入撒盐模式：每块屏盖一层，按住拖动撒盐，右键 / Esc 退出"""
+        if self.salt_overlays:
+            return
+        self.salt_session = set()
+        for f in self.fields.values():
+            o = SaltOverlay(self, f)
+            self.salt_overlays.append(o)
+            o.show()
+        if self.salt_overlays:
+            self.salt_overlays[0].activateWindow()
+
+    def end_salt(self):
+        overlays, self.salt_overlays = self.salt_overlays, []
+        for o in overlays:
+            o.close()
+        if self.salt_session:
+            self.salt_reaction(self.salt_session)
+        self.salt_session = set()
+
+    def salt_ring(self):
+        """整圈撒盐：把现在的样子整个腌住"""
+        for f in self.fields.values():
+            f.mat.salt_all()
+        until = self.salt_until()
+        for p in self.patches:
+            p.salted = until
+            if id(p) in self.patch_views:
+                self.patch_views[id(p)].render()
+        if self.spitter:
+            self.spitter["salted"] = until
+        self.render_mat()
+        self.sound.play("salt")
+        self.salt_reaction(set(self.fields))
+
+    def sweep_salt(self):
+        for f in self.fields.values():
+            f.mat.clear_salt()
+        for p in self.patches:
+            p.salted = 0.0
+            if id(p) in self.patch_views:
+                self.patch_views[id(p)].render()
+        if self.spitter:
+            self.spitter["salted"] = 0.0
+        self.render_mat()
+        self.log_event("屏幕边上的盐被扫掉了")
+        self.save()
+
+    def salt_reaction(self, keys: set[str]):
+        """被撒了盐的那几块屏上的菌：不高兴，嘟囔一句"""
+        self.log_event("有人往菌毯上撒了盐，那一段长不动了")
+        for c in self.creatures:
+            if self.field_of(c).key not in keys:
+                continue
+            c.happiness = max(0.0, c.happiness - SALT_GLOOM)
+            w = self.widgets.get(c.id)
+            if w and c.stage and not w.asleep and c.mood != "dormant":
+                w.say(random.choice(["咸……", "呸，咸的", "边上被腌住了", "……齁"]), delay=random.uniform(0.2, 1.2))
+        self.save()
 
     # ── 喷孢菌 ──
     def shot_gap(self) -> float:
@@ -3403,7 +3707,7 @@ class Colony:
     def spitter_tick(self):
         self.shots = [s for s in self.shots if not s.done]
         if self.spitter and time.time() >= self.spitter["next_at"]:
-            if self.starving():                           # 全体饿扁：不喷，往后推
+            if self.starving() or self.spitter.get("salted", 0) > time.time():   # 全体饿扁 / 被腌着：不喷，往后推
                 self.spitter["next_at"] = time.time() + self.shot_gap()
             else:
                 self.shoot()
@@ -3452,6 +3756,8 @@ class Colony:
         if not sp:
             return ""
         st = sp["stats"]
+        if sp.get("salted", 0) > time.time():
+            return f"喷孢菌（被盐腌着，还要 {fmt_age(sp['salted'] - time.time())}）"
         return (f"喷孢菌\n下一次 ~{max(0, int(sp['next_at'] - time.time()))}s\n"
                 f"喷了 {sp['shots']} 次：" + " · ".join(f"{OUTCOME_NAMES[k]} {st[k]}" for k in OUTCOME_NAMES))
 
@@ -3476,7 +3782,7 @@ class Colony:
         for f in self.fields.values():
             m = f.mat
             if full:
-                todo = {j % m.n for i in m.active for j in range(i - 12, i + 13)}
+                todo = {j % m.n for i in m.active for j in range(i - 12, i + 13)} | {k for k, v in enumerate(m.salt) if v}
             else:
                 todo = m.dirty
             m.dirty = set()
@@ -3506,10 +3812,19 @@ class Colony:
             act.triggered.connect(lambda _=False, k=key: self.set_mat_layer(k))
             group.addAction(act)
 
+        sub.addSeparator()
+        sub.addAction("撒盐…（拖着撒，让它别再长）", self.start_salt)
+        sub.addAction("整圈撒盐（就停在现在这样）", self.salt_ring)
+        sweep = sub.addAction("扫掉盐", self.sweep_salt)
+
         def refresh():
+            sweep.setEnabled(self.salted_share() > 0 or any(p.salted > time.time() for p in self.patches)
+                             or bool(self.spitter and self.spitter.get("salted", 0) > time.time()))
             cover = sum(f.mat.coverage() * f.mat.n for f in self.fields.values()) / max(1, sum(f.mat.n for f in self.fields.values()))
             sub.setTitle(f"菌毯  {cover * 100:.1f}%" + (f" · {len(self.fields)} 块屏" if len(self.fields) > 1 else "")
                          + (f" · 菌斑 {len(self.patches)}" if self.patches else ""))
+            if self.salted_share():
+                sub.setTitle(sub.title() + f" · 盐 {self.salted_share() * 100:.0f}%")
             for act, key in zip(group.actions(), ("top", "bottom", "hidden")):
                 act.setChecked(self.mat_layer == key)
         refresh()
