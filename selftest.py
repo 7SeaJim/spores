@@ -38,6 +38,8 @@ failures = 0
 def check(name, cond, extra=""):
     global failures
     print(("  ok   " if cond else "  FAIL ") + name + (f"   ({extra})" if extra else ""))
+    if not cond and os.environ.get("GITHUB_ACTIONS"):          # 云端：失败项写成公开可见的注解
+        print(f"::error title=自测失败::{name} {str(extra)[:300]}")
     failures += not cond
 
 

@@ -24,7 +24,9 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONUTF8: "1"
-        run: python selftest.py
+        run: |
+          set -o pipefail
+          python selftest.py 2>&1 | tee selftest.log || { echo "::error title=自测日志末尾::$(tail -n 40 selftest.log | sed ':a;N;$!ba;s/\n/%0A/g')"; exit 1; }
 
   windows:
     runs-on: windows-latest
@@ -39,10 +41,20 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           PYTHONUTF8: "1"
           PYTHONIOENCODING: utf-8
-        run: python selftest.py
+        shell: pwsh
+        run: |
+          python selftest.py 2>&1 | Tee-Object -FilePath selftest.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $tail = (Get-Content selftest.log -Tail 40) -join '%0A'
+            Write-Output "::error title=自测日志末尾::$tail"
+            exit $code
+          }
       - name: 打包 FUNGI.exe
+        if: success() || failure()
         run: pyinstaller packaging/fungi.spec --noconfirm
       - name: 启动 15 秒冒烟测试
+        if: success() || failure()
         shell: pwsh
         run: |
           $data = Join-Path $env:RUNNER_TEMP "fungi-smoke"
@@ -53,16 +65,18 @@ jobs:
           if (-not (Test-Path (Join-Path $data "save.json"))) { throw "FUNGI.exe 没有写出 save.json" }
           "FUNGI.exe 启动正常，大小 {0:N1} MB" -f ((Get-Item dist\FUNGI.exe).Length / 1MB)
       - name: 整理发布包
+        if: success() || failure()
         shell: pwsh
         run: |
           New-Item -ItemType Directory release | Out-Null
           Copy-Item dist\FUNGI.exe, LICENSE, THIRD_PARTY_NOTICES.md, README.md release\
       - uses: actions/upload-artifact@v4
+        if: success() || failure()
         with:
           name: FUNGI-windows
           path: release/
       - name: 发布到 Releases（推送 v* 标签时）
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: success() && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
