@@ -50,7 +50,7 @@ from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QTransform, QFo
                          QImage, QPainter, QPainterPath, QPen, QPixmap, QRegion)
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                              QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu, QMessageBox, QPushButton,
-                             QSlider, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget)
+                             QSizePolicy, QSlider, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget)
 
 # ───────────────────────────── 可调参数 ─────────────────────────────
 
@@ -2228,17 +2228,6 @@ class SaltOverlay(QWidget):
             x, y = int(g["x"]) // 2 * 2, int(g["y"] + g["vy"] * t) // 2 * 2
             p.fillRect(x - 1, y - 1, 4, 4, INK)
             p.fillRect(x, y, 2, 2, PAPER)
-        if self.field.key == self.colony.primary_key:
-            text = "撒盐：按住沿屏幕边拖，撒到的地方停住不长（菌斑、喷孢菌也行） · 右键 / Esc 退出"
-            font = ui_font(13)
-            fm = QFontMetrics(font)
-            w, h = fm.horizontalAdvance(text) + 28, 30
-            box = QRect((r.width() - w) // 2, reach + 16, w, h)
-            p.fillRect(box, INK)
-            p.fillRect(box.adjusted(2, 2, -2, -2), PAPER)
-            p.setFont(font)
-            p.setPen(INK)
-            p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
         p.end()
 
     def closeEvent(self, e):
@@ -2422,7 +2411,9 @@ class PixelBar(QWidget):
     def __init__(self):
         super().__init__()
         self.value = 0.0
-        self.setFixedSize(self.CELLS * 9 + 6, 16)
+        self.setFixedHeight(16)
+        self.setMinimumWidth(self.CELLS * 6 + 6)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_value(self, v: float):
         v = max(0.0, min(100.0, v))
@@ -2437,8 +2428,9 @@ class PixelBar(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), INK)
         p.fillRect(self.rect().adjusted(2, 2, -2, -2), PAPER)
+        step = (self.width() - 6) // self.CELLS
         for i in range(self.CELLS):
-            p.fillRect(QRect(4 + i * 9, 4, 7, 8), INK if i < self.lit() else QColor(222, 219, 208))
+            p.fillRect(QRect(4 + i * step, 4, step - 2, 8), INK if i < self.lit() else QColor(222, 219, 208))
         p.end()
 
 
@@ -2450,7 +2442,10 @@ QLabel#title {{ background:{INK.name()}; color:{PAPER.name()}; padding:4px 6px; 
 QPushButton {{ background:{PAPER.name()}; border:2px solid {INK.name()}; padding:4px 8px; }}
 QPushButton:hover {{ background:{INK.name()}; color:{PAPER.name()}; }}
 QPushButton:disabled {{ color:#9a978d; border-color:#9a978d; }}
-QPushButton#close {{ border:none; background:{INK.name()}; color:{PAPER.name()}; padding:2px 8px; }}
+QPushButton#close {{ border:none; background:{INK.name()}; color:{PAPER.name()}; padding:4px 10px; }}
+QPushButton#close:hover {{ background:{PAPER.name()}; color:{INK.name()}; }}
+QPushButton#primary {{ background:{INK.name()}; color:{PAPER.name()}; }}
+QLabel#dim {{ color:#55524c; font-weight:normal; }}
 QTabWidget::pane {{ border:2px solid {INK.name()}; top:-2px; background:{PAPER.name()}; }}
 QTabBar::tab {{ background:{PAPER.name()}; border:2px solid {INK.name()}; padding:3px 10px; margin-right:-2px; }}
 QTabBar::tab:selected {{ background:{INK.name()}; color:{PAPER.name()}; }}
@@ -2462,84 +2457,159 @@ QCheckBox::indicator:checked {{ background:{INK.name()}; }}
 """
 
 
-class StatusPanel(QWidget):
-    """设计图里的 FUNGI.EXE 窗口：头像、数值条、照顾按钮、INFO / FEED LOG / CONFIG"""
+class PixelWindow(QWidget):
+    """像素风小窗口：黑色标题栏（可拖）+ 关闭按钮 + 内容区"""
 
-    def __init__(self, colony: "Colony", widget: CreatureWidget):
+    def __init__(self, title: str):
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.colony, self.widget, self.c = colony, widget, widget.c
         self.drag_from: QPoint | None = None
         self.setObjectName("panel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(PANEL_QSS)
-        self.setWindowTitle(f"FUNGI.EXE · {self.c.name}")
-
-        title = QLabel(f"FUNGI.EXE — {self.c.name}")
-        title.setObjectName("title")
+        self.setWindowTitle(title)
+        self.title = QLabel(title)
+        self.title.setObjectName("title")
         close = QPushButton("×")
         close.setObjectName("close")
         close.clicked.connect(self.close)
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(0)
-        bar.addWidget(title, 1)
+        bar.addWidget(self.title, 1)
         bar.addWidget(close)
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(12, 10, 12, 12)
+        self.body.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(0)
+        outer.addLayout(bar)
+        outer.addLayout(self.body)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < 30:
+            self.drag_from = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self.drag_from is not None:
+            self.move(e.globalPosition().toPoint() - self.drag_from)
+
+    def mouseReleaseEvent(self, e):
+        self.drag_from = None
+
+
+class SaltBar(PixelWindow):
+    """撒盐模式的工具条：说明、盐的覆盖、整圈撒盐 / 扫掉盐 / 完成"""
+
+    def __init__(self, colony: "Colony"):
+        super().__init__("撒盐")
+        self.colony = colony
+        hint = QLabel("按住沿屏幕边拖着撒；点菌斑、喷孢菌根部也能腌住。\n"
+                      f"盐大约 {SALT_HOURS} 小时化完，菌落越旺化得越快。\n"
+                      "右键或 Esc 也能退出。")
+        hint.setObjectName("dim")
+        self.status = QLabel()
+        self.ring_btn = QPushButton("整圈撒盐")
+        self.ring_btn.setToolTip("所有屏幕的菌毯、菌斑、喷孢菌都停在现在的样子")
+        self.ring_btn.clicked.connect(colony.salt_ring)
+        self.sweep_btn = QPushButton("扫掉盐")
+        self.sweep_btn.clicked.connect(colony.sweep_salt)
+        self.done_btn = QPushButton("完成")
+        self.done_btn.setObjectName("primary")
+        self.done_btn.clicked.connect(colony.end_salt)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.ring_btn)
+        row.addWidget(self.sweep_btn)
+        row.addStretch(1)
+        row.addWidget(self.done_btn)
+        self.body.addWidget(hint)
+        self.body.addWidget(self.status)
+        self.body.addLayout(row)
+        self.refresh()
+        self.setFixedWidth(max(380, self.sizeHint().width()))
+        self.adjustSize()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(500)
+
+    def refresh(self):
+        col = self.colony
+        share = col.salted_share()
+        extra = sum(p.salted > time.time() for p in col.patches) + bool(col.spitter and col.spitter.get("salted", 0) > time.time())
+        self.status.setText(f"边缘腌住 {share * 100:.0f}%" + (f"，另有 {extra} 处菌斑 / 喷孢菌" if extra else ""))
+        self.sweep_btn.setEnabled(bool(share or extra))
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        super().closeEvent(e)
+        if self.colony.salt_bar is self:                    # 点了右上角 ×：也算退出撒盐
+            self.colony.end_salt()
+
+
+class StatusPanel(PixelWindow):
+    """设计图里的 FUNGI.EXE 窗口：头像、数值条、照顾按钮、INFO / FEED LOG / CONFIG"""
+
+    def __init__(self, colony: "Colony", widget: CreatureWidget):
+        super().__init__(f"FUNGI.EXE — {widget.c.name}")
+        self.colony, self.widget, self.c = colony, widget, widget.c
 
         self.sprite = QLabel()
-        self.sprite.setFixedSize(84, 84)
+        self.sprite.setFixedSize(80, 80)
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sprite.setStyleSheet(f"border:2px solid {INK.name()};")
         self.facts = QLabel()
+        self.facts.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         head = QHBoxLayout()
+        head.setSpacing(12)
         head.addWidget(self.sprite)
-        head.addSpacing(6)
         head.addWidget(self.facts, 1)
 
         grid = QGridLayout()
-        grid.setVerticalSpacing(4)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
         self.bars: dict[str, tuple[PixelBar, QLabel]] = {}
         for row, key in enumerate(("FULL", "ENERGY", "HAPPY", "GROWTH")):
-            grid.addWidget(QLabel(key), row, 0)
+            name = QLabel(key)
+            name.setFixedWidth(56)
             b, n = PixelBar(), QLabel()
+            n.setFixedWidth(38)
+            n.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(name, row, 0)
             grid.addWidget(b, row, 1)
             grid.addWidget(n, row, 2)
             self.bars[key] = (b, n)
+        grid.setColumnStretch(1, 1)
 
         self.feed_btn = QPushButton("喂食")
+        self.feed_btn.setToolTip("也可以直接把文件拖到它身上\n.txt .md 均衡　.log 精力+　.poem 快乐+\n.todo 成长+　.secret ？？？")
         self.feed_btn.clicked.connect(lambda: colony.feed_dialog(self.widget, folder=False))
         self.water_btn = QPushButton("浇水")
+        self.water_btn.setToolTip(f"精力 +{CARE_AMOUNT}，{CARE_COOLDOWN // 60} 分钟一次")
         self.water_btn.clicked.connect(lambda: self.care("water"))
         self.sun_btn = QPushButton("晒太阳")
+        self.sun_btn.setToolTip(f"快乐 +{CARE_AMOUNT}，{CARE_COOLDOWN // 60} 分钟一次")
         self.sun_btn.clicked.connect(lambda: self.care("sun"))
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         for b in (self.feed_btn, self.water_btn, self.sun_btn):
-            buttons.addWidget(b)
+            buttons.addWidget(b, 1)
 
         self.tabs = QTabWidget()
         self.info = QLabel()
         self.info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.info.setWordWrap(True)
-        self.info.setContentsMargins(8, 8, 8, 8)
+        self.info.setContentsMargins(10, 10, 10, 10)
         self.log = QListWidget()
         self.tabs.addTab(self.info, "INFO")
         self.tabs.addTab(self.log, "FEED LOG")
         self.tabs.addTab(self.config_tab(), "CONFIG")
 
-        self.say = QLabel()
-        self.say.setWordWrap(True)
-        body = QVBoxLayout()
-        body.setContentsMargins(10, 8, 10, 10)
-        body.addLayout(head)
-        body.addLayout(grid)
-        body.addLayout(buttons)
-        body.addWidget(self.say)
-        body.addWidget(self.tabs, 1)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(2, 2, 2, 2)
-        outer.setSpacing(0)
-        outer.addLayout(bar)
-        outer.addLayout(body)
-        self.resize(330, 500)
+        self.body.addLayout(head)
+        self.body.addLayout(grid)
+        self.body.addLayout(buttons)
+        self.body.addWidget(self.tabs, 1)
+        self.resize(340, 480)
 
         self.log_size = -1
         self.timer = QTimer(self)
@@ -2562,6 +2632,9 @@ class StatusPanel(QWidget):
         col = self.colony
         page = QWidget()
         form = QGridLayout(page)
+        form.setContentsMargins(10, 10, 10, 10)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
         self.growth_slider, g_label = self.slider(col.growth_speed, lambda v: col.set_config(growth_speed=v))
         self.hunger_slider, h_label = self.slider(col.hunger_speed, lambda v: col.set_config(hunger_speed=v))
         form.addWidget(QLabel("成长速度"), 0, 0)
@@ -2586,7 +2659,7 @@ class StatusPanel(QWidget):
         return page
 
     def care(self, kind: str):
-        self.say.setText(self.colony.care(self.c, kind))
+        self.widget.say(self.colony.care(self.c, kind))     # 说在它头上，面板里不另开一行
         self.refresh()
 
     def cooldown(self, stamp: float) -> int:
@@ -2599,11 +2672,13 @@ class StatusPanel(QWidget):
             return
         pm = art_pixmap(c.stage, spore_size(c.nutrition) if c.stage == 0 else 3,
                         wither=c.mood in ("starving", "dormant"), mood=c.mood)
-        self.sprite.setPixmap(pm.scaled(76, 76, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+        k = max(1, min(4, 68 // max(pm.width(), pm.height(), 1)))       # 整数倍放大，小孢子不糊成一大块
+        self.sprite.setPixmap(pm.scaled(pm.width() * k, pm.height() * k, Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.FastTransformation))
         box = self.widget.sprite_rect
-        self.facts.setText(f"NAME  {c.name}\nAGE   {fmt_age(time.time() - c.born)}\n"
-                           f"SIZE  {box.width() // PX}×{box.height() // PX}\nGEN   {c.gen}\n"
-                           f"{c.stage_name.upper()}  {MOOD_NAMES[c.mood]}")
+        self.facts.setText(f"NAME   {c.name}\nSTAGE  {c.stage_name}" + (f" · {MOOD_NAMES[c.mood]}" if MOOD_NAMES[c.mood] else "")
+                           + f"\nAGE    {fmt_age(time.time() - c.born)}\nSIZE   {box.width() // PX}×{box.height() // PX}"
+                           f"\nGEN    {c.gen}")
         lo, hi = c.stage_floor(), c.next_goal()
         grow = 100 * max(0.0, min(1.0, (c.nutrition - lo) / max(1, hi - lo)))
         for key, v in (("FULL", c.satiety / SATIETY_MAX * 100), ("ENERGY", c.energy), ("HAPPY", c.happiness),
@@ -2616,13 +2691,12 @@ class StatusPanel(QWidget):
             btn.setEnabled(left == 0)
             btn.setText(name if left == 0 else f"{name} {left}m")
         cover = 100 * self.colony.mat_occupied()
-        self.info.setText(f"阶段  {c.stage_name}（{int(c.nutrition)}/{hi}）\n"
-                          f"状态  {MOOD_CN[c.mood]}，{'有点困' if c.tired else '精神'}，"
+        salt = self.colony.salted_share()
+        self.info.setText(f"状态　{MOOD_CN[c.mood]}，{'有点困' if c.tired else '精神'}，"
                           f"{ {'gloomy': '闷闷不乐', 'cheery': '很开心', 'plain': '心情平平'}[c.spirit] }\n"
-                          f"喂过  {c.feeds} 次　放出孢子 {c.released} 个\n"
-                          f"菌落  {len(self.colony.creatures)} 只　菌毯覆盖 {cover:.0f}%"
-                          + (f"　盐 {self.colony.salted_share() * 100:.0f}%" if self.colony.salted_share() else "") + "\n\n"
-                          f".txt .md 均衡　.log 精力+\n.poem 快乐+　.todo 成长+\n.secret ？？？")
+                          f"成长　{int(c.nutrition)} / {hi}\n"
+                          f"喂过　{c.feeds} 次，放出孢子 {c.released} 个\n"
+                          f"菌落　{len(self.colony.creatures)} 只，菌毯 {cover:.0f}%" + (f"，盐 {salt * 100:.0f}%" if salt else ""))
         if len(c.log) != self.log_size:
             self.log_size = len(c.log)
             self.log.clear()
@@ -2630,17 +2704,6 @@ class StatusPanel(QWidget):
                 self.log.addItem(f"{time.strftime('%m-%d %H:%M', time.localtime(ts))}  {label}  +{value}")
             if not c.log:
                 self.log.addItem("（还没吃过东西）")
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < 30:
-            self.drag_from = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, e):
-        if self.drag_from is not None:
-            self.move(e.globalPosition().toPoint() - self.drag_from)
-
-    def mouseReleaseEvent(self, e):
-        self.drag_from = None
 
     def closeEvent(self, e):
         self.timer.stop()
@@ -2676,6 +2739,7 @@ class Colony:
         self.mat_acc = 0.0
         self.salt_acc = 0.0
         self.salt_overlays: list[SaltOverlay] = []
+        self.salt_bar: SaltBar | None = None
         self.salt_session: set[str] = set()               # 这次撒盐撒到了哪几块屏
         self.offline_elapsed = 0.0
         self.spitter: dict | None = None
@@ -3589,13 +3653,20 @@ class Colony:
             o = SaltOverlay(self, f)
             self.salt_overlays.append(o)
             o.show()
-        if self.salt_overlays:
-            self.salt_overlays[0].activateWindow()
+        self.salt_bar = SaltBar(self)
+        a = self.fields[self.primary_key].rect
+        self.salt_bar.move(a.center().x() - self.salt_bar.width() // 2, a.top() + (SALT_REACH + 4) * PX)
+        self.salt_bar.show()
+        self.salt_bar.raise_()
+        self.salt_overlays[0].activateWindow()
 
     def end_salt(self):
         overlays, self.salt_overlays = self.salt_overlays, []
+        bar, self.salt_bar = self.salt_bar, None
         for o in overlays:
             o.close()
+        if bar and not sip.isdeleted(bar):
+            bar.close()
         if self.salt_session:
             self.salt_reaction(self.salt_session)
         self.salt_session = set()
@@ -3613,7 +3684,10 @@ class Colony:
             self.spitter["salted"] = until
         self.render_mat()
         self.sound.play("salt")
-        self.salt_reaction(set(self.fields))
+        if self.salt_overlays:                             # 在撒盐模式里点的：退出时一起嘟囔
+            self.salt_session |= set(self.fields)
+        else:
+            self.salt_reaction(set(self.fields))
 
     def sweep_salt(self):
         for f in self.fields.values():
@@ -3767,13 +3841,12 @@ class Colony:
             return
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
-        for line in (f"NAME   喷孢菌", f"AGE    {fmt_age(time.time() - sp['born'])}", f"SHOTS  {sp['shots']}",
-                     "  ".join(f"{OUTCOME_NAMES[k]} {sp['stats'][k]}" for k in OUTCOME_NAMES),
-                     f"NEXT   ~{max(0, int(sp['next_at'] - time.time()))}s"):
-            m.addAction(line).setEnabled(False)
+        salted = sp.get("salted", 0) > time.time()
+        m.addAction(f"喷孢菌 · 喷了 {sp['shots']} 次 · " + ("被盐腌着" if salted else
+                    f"下一次 ~{max(0, int(sp['next_at'] - time.time()))}s")).setEnabled(False)
         m.addSeparator()
-        m.addAction("现在喷！", lambda: sp.__setitem__("next_at", time.time() + 0.8))
-        self.mat_menu(m)
+        m.addAction("现在喷！", lambda: sp.__setitem__("next_at", time.time() + 0.8)).setEnabled(not salted)
+        m.addAction("撒盐…", self.start_salt)
         m.addSeparator()
         m.addAction("退出", QApplication.instance().quit)
         m.exec(pos)
@@ -3801,8 +3874,13 @@ class Colony:
         self.build_mat_views()
         self.save()
 
+    def mat_coverage(self) -> float:
+        cells = sum(f.mat.n for f in self.fields.values())
+        return sum(f.mat.coverage() * f.mat.n for f in self.fields.values()) / max(1, cells)
+
     def mat_menu(self, parent: QMenu) -> QMenu:
-        sub = parent.addMenu("菌毯")
+        """菌毯怎么显示（放在「设置」里）"""
+        sub = parent.addMenu("菌毯显示")
         sub.setStyleSheet(MENU_QSS)
         group = QActionGroup(sub)
         for key, label in (("top", "铺在窗口上面"), ("bottom", "只铺在桌面上"), ("hidden", "隐藏")):
@@ -3811,24 +3889,21 @@ class Colony:
             act.setChecked(self.mat_layer == key)
             act.triggered.connect(lambda _=False, k=key: self.set_mat_layer(k))
             group.addAction(act)
+        return sub
 
-        sub.addSeparator()
-        sub.addAction("撒盐…（拖着撒，让它别再长）", self.start_salt)
-        sub.addAction("整圈撒盐（就停在现在这样）", self.salt_ring)
-        sweep = sub.addAction("扫掉盐", self.sweep_salt)
-
-        def refresh():
-            sweep.setEnabled(self.salted_share() > 0 or any(p.salted > time.time() for p in self.patches)
-                             or bool(self.spitter and self.spitter.get("salted", 0) > time.time()))
-            cover = sum(f.mat.coverage() * f.mat.n for f in self.fields.values()) / max(1, sum(f.mat.n for f in self.fields.values()))
-            sub.setTitle(f"菌毯  {cover * 100:.1f}%" + (f" · {len(self.fields)} 块屏" if len(self.fields) > 1 else "")
-                         + (f" · 菌斑 {len(self.patches)}" if self.patches else ""))
-            if self.salted_share():
-                sub.setTitle(sub.title() + f" · 盐 {self.salted_share() * 100:.0f}%")
-            for act, key in zip(group.actions(), ("top", "bottom", "hidden")):
-                act.setChecked(self.mat_layer == key)
-        refresh()
-        parent.aboutToShow.connect(refresh)
+    def settings_menu(self, parent: QMenu) -> QMenu:
+        sub = parent.addMenu("设置")
+        sub.setStyleSheet(MENU_QSS)
+        top = sub.addAction("总在最前")
+        top.setCheckable(True)
+        top.setChecked(self.on_top)
+        top.toggled.connect(self.set_on_top)
+        devour = sub.addAction("吞噬文件（吃掉后" + ("进回收站）" if sys.platform == "win32" else "删除）"))
+        devour.setCheckable(True)
+        devour.setChecked(self.devour)
+        devour.toggled.connect(self.set_devour)
+        self.mat_menu(sub)
+        sub.addAction("聊天设置…" + ("" if self.chat_ready() else "（未设置）"), self.chat_settings)
         return sub
 
     def feed(self, widget: CreatureWidget, paths: list[Path]):
@@ -4033,54 +4108,33 @@ class Colony:
 
     # ── 菜单 ──
     def show_menu(self, widget: CreatureWidget, pos: QPoint):
+        m = self.pet_menu(widget)
+        m.exec(pos)
+
+    def pet_menu(self, widget: CreatureWidget) -> QMenu:
+        """右键菜单：一行概况 → 照顾它 → 撒盐 → 设置 / 退出。详细数值都在状态面板里。"""
         c = widget.c
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
-
-        def info(text):
-            a = m.addAction(text)
-            a.setEnabled(False)
-
-        lo, hi = c.stage_floor(), c.next_goal()
-        filled = round(10 * max(0.0, min(1.0, (c.nutrition - lo) / (hi - lo))))
-        info(f"NAME   {c.name}")
-        info(f"STAGE  {c.stage_name}")
-        info(f"AGE    {fmt_age(time.time() - c.born)}")
-        info(f"GEN    {c.gen}")
-        info(f"FOOD   {'█' * filled}{'░' * (10 - filled)} {int(c.nutrition)}/{hi}")
-        full = round(10 * c.satiety / SATIETY_MAX)
-        info(f"FULL   {'█' * full}{'░' * (10 - full)} {int(c.satiety)}%  {MOOD_NAMES[c.mood]}")
-        for label, v in (("ENERGY", c.energy), ("HAPPY", c.happiness)):
-            info(f"{label:<6} {'█' * round(v / 10)}{'░' * (10 - round(v / 10))} {int(v)}%")
-        info(f"FEEDS  {c.feeds}   SPORES {c.released}")
+        mood = MOOD_NAMES[c.mood]
+        head = [c.name] + ([c.stage_name] if c.stage_name != c.name else []) + [f"饱 {int(c.satiety)}%"] + ([mood] if mood else [])
+        m.addAction(" · ".join(head)).setEnabled(False)
         m.addSeparator()
         m.addAction("状态面板…", lambda: self.open_panel(widget))
-        m.addAction("聊天…（双击也行）", lambda: self.open_chat(widget))
-        log_menu = m.addMenu("最近吃的")
-        log_menu.setStyleSheet(MENU_QSS)
-        for ts, label, value in reversed(c.log[-8:]):
-            log_menu.addAction(f"[{time.strftime('%m-%d %H:%M', time.localtime(ts))}] {label}  +{value}").setEnabled(False)
-        if not c.log:
-            log_menu.addAction("（还没吃过东西）").setEnabled(False)
-        m.addAction("喂文件…", lambda: self.feed_dialog(widget, folder=False))
-        m.addAction("喂文件夹…", lambda: self.feed_dialog(widget, folder=True))
-        devour = m.addAction("吞噬文件（吃掉后" + ("进回收站）" if sys.platform == "win32" else "删除）"))
-        devour.setCheckable(True)
-        devour.setChecked(self.devour)
-        devour.toggled.connect(self.set_devour)
+        m.addAction("聊天…", lambda: self.open_chat(widget))
+        feed = m.addMenu("喂食")
+        feed.setStyleSheet(MENU_QSS)
+        feed.addAction("文件…", lambda: self.feed_dialog(widget, folder=False))
+        feed.addAction("文件夹…", lambda: self.feed_dialog(widget, folder=True))
         m.addSeparator()
-        top = m.addAction("总在最前")
-        top.setCheckable(True)
-        top.setChecked(self.on_top)
-        top.toggled.connect(self.set_on_top)
+        m.addAction("撒盐…", self.start_salt)
         m.addAction("叫大家回来", self.gather)
-        self.mat_menu(m)
-        m.addAction("聊天设置…" + ("" if self.chat_ready() else "（未设置）"), self.chat_settings)
+        m.addSeparator()
+        self.settings_menu(m)
         if len(self.creatures) > 1:
             m.addAction(f"放生 {c.name}…", lambda: self.release(widget))
-        m.addSeparator()
         m.addAction("退出", QApplication.instance().quit)
-        m.exec(pos)
+        return m
 
     def feed_dialog(self, widget: CreatureWidget, folder: bool):
         if folder:
@@ -4152,13 +4206,14 @@ class Colony:
         tray.setToolTip("FUNGI.EXE")
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
+        m.addAction("撒盐…", self.start_salt)
         m.addAction("叫大家回来", self.gather)
-        self.mat_menu(m)
-        m.addAction("聊天设置…", self.chat_settings)
-        m.addAction(f"存档位置：{self.save_path}").setEnabled(False)
+        m.addSeparator()
+        self.settings_menu(m)
         m.addAction("重新开始…", self.reset)
         m.addSeparator()
         m.addAction("退出", QApplication.instance().quit)
+        m.setToolTip(f"存档：{self.save_path}")
         tray.setContextMenu(m)
         tray.show()
         tray._menu = m

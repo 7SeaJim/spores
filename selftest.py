@@ -73,6 +73,7 @@ def shutdown(colony):
         w.timer.stop()
         w.close()
     colony.spitter_timer.stop()
+    colony.end_salt()
     for p in list(colony.panels.values()):
         p.close()
     colony.fullscreen_timer.stop()
@@ -1548,10 +1549,32 @@ colony27.sweep_salt()
 check("扫掉盐：马上恢复", colony27.salted_share() == 0 and colony27.patches[0].salted == 0 and not colony27.spitter["salted"])
 colony27.mat.salt_at(10)
 check("聊天人设里知道边上撒了盐", "撒了盐" in colony27.persona(c27 if c27 in colony27.creatures else colony27.creatures[0]))
+menu27 = colony27.pet_menu(colony27.widgets[colony27.creatures[0].id])
+top27 = [a.text() for a in menu27.actions() if not a.isSeparator()]
+check("右键菜单：撒盐是单独的一项，不再塞在菌毯里", "撒盐…" in top27 and "菌毯" not in " ".join(top27))
+check("右键菜单精简：只有一行概况，数值都去状态面板", sum(not a.isEnabled() for a in menu27.actions() if not a.isSeparator()) == 1
+      and len(top27) <= 10, top27)
+settings27 = next(a.menu() for a in menu27.actions() if a.text() == "设置")
+check("置顶、吞噬、菌毯显示、聊天设置都收进「设置」", [a.text().split("（")[0] for a in settings27.actions()][:3] == ["总在最前", "吞噬文件", "菌毯显示"])
+colony27.start_salt()
+bar27 = colony27.salt_bar
+check("撒盐模式有单独的工具条", bar27 is not None and bar27.isVisible() and bar27.sweep_btn.isEnabled() == (colony27.salted_share() > 0))
+bar27.ring_btn.click()
+bar27.refresh()
+check("工具条：整圈撒盐，状态跟着变，扫盐按钮可用", colony27.salted_share() == 1 and "100%" in bar27.status.text() and bar27.sweep_btn.isEnabled())
+out_dir.mkdir(parents=True, exist_ok=True)
+bar27.grab().save(str(out_dir / "salt_bar.png"))
+bar27.sweep_btn.click()
+check("工具条：扫掉盐", colony27.salted_share() == 0)
+bar27.done_btn.click()
+check("工具条：完成就退出撒盐模式", not colony27.salt_overlays and colony27.salt_bar is None)
+colony27.start_salt()
+colony27.salt_bar.close()
+check("点工具条的 × 也退出撒盐模式", not colony27.salt_overlays)
 colony27.start_salt()
 colony27.salt_overlays[0].idle_since = time.time() - 100
 colony27.salt_overlays[0].tick()
-check("忘了退出：一阵子没动自己关掉", not colony27.salt_overlays)
+check("忘了退出：一阵子没动自己关掉", not colony27.salt_overlays and colony27.salt_bar is None)
 shutdown(colony27)
 
 # ── 预览图 ──
