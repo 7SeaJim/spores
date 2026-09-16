@@ -221,7 +221,29 @@ CHAT_BURST = (15, 600)     # 整个菌落每 600 秒最多调几次 API（防止
 CHAT_ERRORS = {400: "请求格式不对", 401: "API Key 不对", 402: "DeepSeek 余额不足", 422: "参数不对，检查模型名",
                429: "说太快了，等等", 500: "DeepSeek 那边出错了", 503: "DeepSeek 太忙了"}
 
-EDIBLE_EXT = {".txt", ".md"}
+# 精力、快乐（设计图里的 ENERGY / HAPPINESS）
+ENERGY_DRAIN = 4           # 醒着每小时掉多少精力
+ENERGY_REST = 20           # 睡着（或关着程序）每小时回多少精力
+HAPPY_DECAY = 2            # 每小时自然掉多少快乐；饿扁时再多掉 STARVE_GLOOM
+STARVE_GLOOM = 8
+OFFLINE_GLOOM_CAP = 30     # 关闭期间快乐最多掉多少
+TIRED_AT = 25              # 精力低于这个：更容易困、小动作变少
+GLOOMY_AT = 30             # 快乐低于这个：会嘟囔
+CHEERY_AT = 70             # 快乐高于这个：更爱蹦跶
+CARE_COOLDOWN = 1800       # 浇水、晒太阳的冷却（秒）
+CARE_AMOUNT = 20           # 浇水 +精力，晒太阳 +快乐
+
+# 后缀: (营养倍率, 每 1 营养加多少精力, 每 1 营养加多少快乐, 飘字)
+FOOD_KINDS = {
+    ".txt": (1.0, 0.0, 0.0, ""),
+    ".md": (1.0, 0.0, 0.0, ""),
+    ".log": (0.6, 2.5, 0.0, "精力+"),
+    ".poem": (0.6, 0.0, 2.5, "快乐+"),
+    ".todo": (1.5, 0.0, 0.0, "成长+"),
+    ".secret": (1.0, 0.0, 0.0, "？？？"),
+}
+LOG_HOT_MINUTES = 10       # 这么多分钟内还在被写的 .log 不吃（可能是正在用的日志）
+EDIBLE_EXT = set(FOOD_KINDS)
 MAX_ITEMS_PER_DROP = 5
 
 NAMES = ["puff", "kino", "shii", "enoki", "morel", "nameko", "maitake", "chanty",
@@ -448,6 +470,10 @@ class Creature:
     feeds: int = 0
     released: int = 0                                   # 已放出的 spores 数
     satiety: float = 60.0                               # 饱腹 0–100
+    energy: float = 70.0                                # 精力 0–100
+    happiness: float = 60.0                             # 快乐 0–100
+    watered: float = 0.0                                # 上次浇水 / 晒太阳的时间（冷却用）
+    sunned: float = 0.0
     parent: str = ""                                    # 母体的 id；"spitter" = 喷孢菌喷出来的；"" = 菌落始祖
     x: int = 0                                          # 脚底中心的屏幕坐标
     y: int = 0
@@ -474,6 +500,15 @@ class Creature:
         if self.satiety > 0:
             return "hungry"
         return "dormant" if self.nutrition <= 0 else "starving"
+
+    @property
+    def tired(self) -> bool:
+        return self.energy < TIRED_AT
+
+    @property
+    def spirit(self) -> str:
+        """心情：gloomy / plain / cheery"""
+        return "gloomy" if self.happiness < GLOOMY_AT else "cheery" if self.happiness > CHEERY_AT else "plain"
 
     @property
     def growth_factor(self) -> float:
@@ -503,6 +538,10 @@ class Food:
     note: str = ""
     targets: list[Path] = field(default_factory=list)   # 吞噬时要吃掉的文件
     taste: list[str] = field(default_factory=list)      # 口味：未整理的 / 久放的 / 干巴巴 / 已归档 …
+    energy: float = 0.0                                 # 吃完加多少精力（.log）
+    happy: float = 0.0                                  # 吃完加多少快乐（.poem）
+    secret: bool = False                                # 里面有 .secret：喂的时候随机抽效果
+    kind: str = ""                                      # 飘字：精力+ / 快乐+ / 成长+ / ？？？
     dirs: list[Path] = field(default_factory=list)      # 吃完后尝试清掉的空目录（深的在前）
 
 
@@ -598,6 +637,26 @@ def residue_of(path: Path) -> dict | None:
     return {"name": path.name[:40], "line": line, "year": time.localtime(st.st_mtime).tm_year, "burped": 0}
 
 
+def hot_log(path: Path) -> bool:
+    """还在被写入的日志：最近 LOG_HOT_MINUTES 分钟改过"""
+    try:
+        return path.suffix.lower() == ".log" and time.time() - path.stat().st_mtime < LOG_HOT_MINUTES * 60
+    except OSError:
+        return False
+
+
+def food_kind(files: list[Path]) -> tuple[float, float, float, bool, str]:
+    """按后缀占比折算：(营养倍率, 每营养精力, 每营养快乐, 有没有 .secret, 飘字)"""
+    kinds = [FOOD_KINDS[f.suffix.lower()] for f in files if f.suffix.lower() in FOOD_KINDS]
+    if not kinds:
+        return 1.0, 0.0, 0.0, False, ""
+    n = len(kinds)
+    mult, energy, happy = (sum(k[i] for k in kinds) / n for i in range(3))
+    notes = [k[3] for k in kinds if k[3]]
+    note = max(set(notes), key=notes.count) if notes else ""
+    return mult, energy, happy, any(f.suffix.lower() == ".secret" for f in files), note
+
+
 def digest(path: Path) -> tuple[Food | None, str]:
     """把一个路径变成食物。只看 stat 和目录结构，不读文件内容；真正吃掉（删除）由 Colony.devour 做。"""
     try:
@@ -609,16 +668,25 @@ def digest(path: Path) -> tuple[Food | None, str]:
         return None, "飘着，够不到"
     if path.is_dir():
         files, dirs = find_edible(path)
+        files = [f for f in files if not hot_log(f)]
         if not files:
             return Food(path.name + "/", 3, key, "空空的", [], dirs=dirs), ""
         mult, notes = folder_taste(path, files)
-        return Food(path.name + "/", max(1, round(min(30, 6 + 2 * len(files)) * mult)), key, "", files, dirs=dirs, taste=notes), ""
+        kmult, energy, happy, secret, kind = food_kind(files)
+        value = max(1, round(min(30, 6 + 2 * len(files)) * mult * kmult))
+        return Food(path.name + "/", value, key, "", files, dirs=dirs, taste=notes,
+                    energy=value * energy, happy=value * happy, secret=secret, kind=kind), ""
     if path.suffix.lower() in EDIBLE_EXT:
+        if hot_log(path):
+            return None, "还热着，等它凉一凉"
         if st.st_size == 0:
             return Food(path.name, 2, key, "空的…", [path]), ""
         mult, notes = taste(path.name, st.st_mtime)
+        kmult, energy, happy, secret, kind = food_kind([path])
         base = min(20, 4 + int(3 * math.log2(st.st_size / 256 + 1)))
-        return Food(path.name, max(1, round(base * mult)), key, "", [path], taste=notes), ""
+        value = max(1, round(base * mult * kmult))
+        return Food(path.name, value, key, "", [path], taste=notes, energy=value * energy, happy=value * happy,
+                    secret=secret, kind=kind), ""
     return None, f"不吃 {path.suffix or path.name}"
 
 
@@ -986,7 +1054,7 @@ class CreatureWidget(QWidget):
             self.asleep = False
             return
         busy = self.anim or self.press or self.flight or self.drag_over or self.hover
-        if not self.asleep and not busy and now - self.last_touch > self.colony.sleep_after():
+        if not self.asleep and not busy and now - self.last_touch > self.colony.sleep_after(self.c):
             self.asleep = True
             self.z_at = now + 0.8
         if self.asleep:
@@ -997,8 +1065,18 @@ class CreatureWidget(QWidget):
             return
         if busy or now < self.idle_at:
             return
-        self.idle_at = now + random.uniform(*IDLE_GAP)
-        acts = HUNGRY_IDLE.get(self.c.mood, IDLE_WEIGHTS[self.c.stage])
+        self.idle_at = now + random.uniform(*IDLE_GAP) * (2 if self.c.tired else 1)
+        acts = HUNGRY_IDLE.get(self.c.mood)
+        if acts is None:
+            acts = list(IDLE_WEIGHTS[self.c.stage])
+            if self.c.spirit == "gloomy":
+                acts = [("sulk", 3), ("blink2", 2)]
+            elif self.c.spirit == "cheery":
+                acts += [("hop", 3)]
+            if self.c.tired:
+                acts = [(a, w) for a, w in acts if a not in ("hop", "puff")] + [("yawn", 2)]
+            if self.c.stage == 0:                                  # 孢子不会说话
+                acts = [(a, w) for a, w in acts if a not in ("sulk", "yawn")] or [("wiggle", 1)]
         self.do_idle(random.choices([a for a, _ in acts], [w for _, w in acts])[0])
 
     def do_idle(self, act: str):
@@ -1007,6 +1085,10 @@ class CreatureWidget(QWidget):
             self.blinks = [now, now + 0.3]
         elif act == "puff":
             self.puff()
+        elif act == "sulk":
+            self.say(random.choice(["……不开心", "今天的菌丝有点蔫", "……"]))
+        elif act == "yawn":
+            self.say(random.choice(["哈……", "困……", "眼皮好沉"]))
         elif act == "grumble":
             self.say(random.choice(["饿…", "咕…", "……", "想吃 .txt"]) if self.c.mood == "hungry"
                      else random.choice(["好饿……", "咕噜……", "……"]))
@@ -1227,6 +1309,7 @@ class CreatureWidget(QWidget):
         else:
             self.play("poke")
             self.say(random.choice(["?", "…", "!", "嗯？"]) if self.c.stage else "·")
+            self.c.happiness = min(100.0, self.c.happiness + 2)       # 被戳一下有点开心
 
     def enterEvent(self, e):
         self.touch()
@@ -2003,6 +2086,8 @@ class Colony:
         self.name_i = 0
         self.on_top = True
         self.last_tick = time.time()
+        self.growth_speed = 1.0                           # 状态面板 CONFIG 里调
+        self.hunger_speed = 1.0
         self.mat: Mycelium | None = None
         self.mat_layer = "top"
         self.mat_views: dict[str, MatStrip] = {}
@@ -2071,9 +2156,10 @@ class Colony:
         self.watch_screen(QGuiApplication.primaryScreen(), initial=True)
         self.tray = self.make_tray()
 
-    def sleep_after(self) -> float:
+    def sleep_after(self, c: Creature | None = None) -> float:
         base = 40 if self.fast else SLEEP_AFTER
-        return base / 5 if time.localtime().tm_hour < 7 else base
+        base = base / 5 if time.localtime().tm_hour < 7 else base
+        return base / 3 if c is not None and c.tired else base     # 困了更容易睡着
 
     # ── 存档 ──
     def default_spot(self) -> tuple[int, int]:
@@ -2167,7 +2253,8 @@ class Colony:
         self.last_tick = now
         for c in list(self.creatures):
             before = c.stage
-            self.metabolize(c, dt * self.passive_mult)
+            w = self.widgets.get(c.id)
+            self.metabolize(c, dt * self.passive_mult, asleep=bool(w and w.asleep))
             if c.stage != before or c.spores_due() > 0:
                 self.after_growth(self.widgets[c.id], before)
         self.track_moods()
@@ -2439,6 +2526,8 @@ class Colony:
         if re.search(r"吃|饿|饱|喂", text):
             return {"full": "吃饱了，那几团松的还在肚子里慢慢化。", "hungry": "有点饿，拖个 .txt 过来吧。",
                     "starving": "随便给一口 .md 就行。"}.get(c.mood, "")
+        if re.search(r"开心|心情|高兴", text):
+            return {"gloomy": "有点蔫，晒晒太阳也许会好。", "cheery": "很好，伞面都是松的。", "plain": "还行，菌丝平平地铺着。"}[c.spirit]
         if re.search(r"累|困|烦|难过|不开心|压力|崩溃", text):
             return "那就别整理了，乱着放，我们替你守着。"
         if re.search(r"晚安|睡了|拜拜|再见|明天见|走了", text):
@@ -2491,7 +2580,9 @@ class Colony:
                 "只回复一句话，一句就完：不超过 30 个字，不换行，不要说自己是 AI。"
                 "下面的资料就是你知道的全部：资料里的每一只菌你都认识；资料里没有的名字和事情就说不知道，不要编。\n\n"
                 + FILEGU_STYLE + "\n\n"
-                f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，{age_words}，{fed}，{family}。\n"
+                f"【你自己】你叫 {c.name}，{STAGE_CN[c.stage_name]}，{MOOD_CN[c.mood]}，"
+                f"{'有点困' if c.tired else '精神还行'}，{ {'gloomy': '有点闷闷不乐', 'cheery': '心情很好', 'plain': '心情平平'}[c.spirit] }，"
+                f"{age_words}，{fed}，{family}。\n"
                 "【菌落成员】\n" + ("\n".join(others) if others else "- 只有你自己") + "\n"
                 "【环境】" + "；".join(world) + "。\n"
                 "【最近发生的事】\n" + ("\n".join(events) if events else "- 还没发生什么") + "\n"
@@ -2588,6 +2679,7 @@ class Colony:
         history += [{"role": "user", "content": text, "t": now}, said]
         del history[:-CHAT_MEMORY]
         self.save_memory()
+        w.c.happiness = min(100.0, w.c.happiness + 2)                # 有人陪它说话
         self.show_bubble(w, reply)
         if "已归档" in reply:
             w.play("shake")                               # 说「已归档」的时候抖一下伞
@@ -2605,14 +2697,17 @@ class Colony:
         return bubble
 
     # ── 饥饿 ──
-    def metabolize(self, c: Creature, seconds: float):
-        """在线的 seconds 秒（已乘速度倍率）：吃饱正常长、饿了长一半、饿扁了掉营养"""
+    def metabolize(self, c: Creature, seconds: float, asleep: bool = False):
+        """在线的 seconds 秒（已乘速度倍率）：吃饱正常长、饿了长一半、饿扁了掉营养；醒着掉精力、睡着回精力；快乐慢慢掉"""
         hours = seconds / 3600
         if c.satiety > 0:
-            c.nutrition += seconds / PASSIVE_SECONDS * c.growth_factor
-            c.satiety = max(0.0, c.satiety - hours * SATIETY_MAX / HUNGER_HOURS)
+            c.nutrition += seconds / PASSIVE_SECONDS * c.growth_factor * self.growth_speed
+            c.satiety = max(0.0, c.satiety - hours * SATIETY_MAX / HUNGER_HOURS * self.hunger_speed)
         else:
             c.nutrition = max(0.0, c.nutrition - hours * STARVE_LOSS)
+        rest = asleep or c.mood == "dormant"
+        c.energy = max(0.0, min(100.0, c.energy + hours * (ENERGY_REST if rest else -ENERGY_DRAIN)))
+        c.happiness = max(0.0, c.happiness - hours * (HAPPY_DECAY + (STARVE_GLOOM if c.mood == "starving" else 0)))
 
     def offline_metabolize(self, c: Creature, seconds: float) -> float:
         """关闭期间：先吃老本长（有上限），饿扁之后掉营养（有上限）。返回营养变化。"""
@@ -2624,7 +2719,21 @@ class Colony:
         before = c.nutrition
         c.satiety = max(0.0, c.satiety - hours * rate)
         c.nutrition = max(0.0, c.nutrition + grow - starve)
+        c.energy = min(100.0, c.energy + hours * ENERGY_REST)             # 关着程序 = 一直在睡
+        c.happiness = max(0.0, c.happiness - min(OFFLINE_GLOOM_CAP, hours * HAPPY_DECAY))
         return c.nutrition - before
+
+    def care(self, c: Creature, kind: str) -> str:
+        """浇水（+精力）/ 晒太阳（+快乐），各有冷却；返回给气泡的话"""
+        now = time.time()
+        stamp, attr = ("watered", "energy") if kind == "water" else ("sunned", "happiness")
+        left = CARE_COOLDOWN / self.passive_mult - (now - getattr(c, stamp))
+        if left > 0:
+            return f"刚{'浇过水' if kind == 'water' else '晒过了'}，{max(1, math.ceil(left / 60))} 分钟后再来"
+        setattr(c, stamp, now)
+        setattr(c, attr, min(100.0, getattr(c, attr) + CARE_AMOUNT))
+        self.save()
+        return "咕嘟……精神了一点" if kind == "water" else "暖……伞面都松开了"
 
     def starving(self) -> bool:
         """全体都饿扁 / 休眠了"""
@@ -2642,7 +2751,7 @@ class Colony:
     def mat_step(self):
         vigor = 0.0
         for c in self.creatures:
-            v = MAT_VIGOR[c.stage] * c.growth_factor
+            v = MAT_VIGOR[c.stage] * c.growth_factor * (0.8 + 0.4 * c.happiness / 100)   # 开心的菌落长得快一点
             vigor += v
             if random.random() < MAT_SEED * v and self.mat.seed(self.mat_index(c)):
                 w = self.widgets.get(c.id)
@@ -2937,16 +3046,29 @@ class Colony:
                     continue
                 if done < len(food.targets):
                     food.value = max(1, round(food.value * done / len(food.targets)))
-            value, note = food.value, food.note or "、".join(food.taste[:2])
+            value, note = food.value, food.note or food.kind or "、".join(food.taste[:2])
             if self.devour:
                 self.keep_residue(c, pieces)
             if food.key in c.eaten:
                 value, note = max(1, value // 4), note or "嚼过了"
             else:
                 c.eaten = (c.eaten + [food.key])[-500:]
+            energy, happy = food.energy, food.happy
+            if food.secret:                               # .secret：随机一种
+                roll = random.random()
+                if roll < 1 / 3:
+                    value, note = value * 2, "？？？肥"
+                elif roll < 2 / 3:
+                    energy, happy, note = energy + CARE_AMOUNT, happy + CARE_AMOUNT, "？？？暖"
+                else:
+                    note = "……这个不能说"
+                    if self.residue.get(c.id):
+                        QTimer.singleShot(1500, lambda: self.burp(widget))
             value *= self.gain_mult
             c.nutrition += value
             c.satiety = min(SATIETY_MAX, c.satiety + value * SATIETY_PER_FOOD)
+            c.energy = min(100.0, c.energy + energy * self.gain_mult)
+            c.happiness = min(100.0, c.happiness + happy * self.gain_mult + 2 + (1 if food.taste and food.taste[0] != "干巴巴" else 0))
             c.feeds += 1
             c.log = (c.log + [[int(time.time()), food.label, value]])[-50:]
             eaten.append((value, note))

@@ -1250,6 +1250,107 @@ check("Key 不对：照实说出来，不拿本地回复糊弄", "API Key 不对
 F.chat_request, F.pick_style = real_request, real_pick
 shutdown(colony24)
 
+print("23. 精力、快乐和新食物")
+colony25 = F.Colony(root / "save25")
+c25 = colony25.creatures[0]
+w25 = colony25.widgets[c25.id]
+c25.nutrition, c25.satiety = F.STAGES[F.ADULT][1] + 1, 100
+colony25.after_growth(w25, 0)
+food25 = root / "food25"
+food25.mkdir()
+old = time.time() - 3600
+
+
+def dish(name, text="一些字\n" * 40, mtime=old):
+    p = food25 / name
+    p.write_text(text, encoding="utf-8")
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+hot, why = F.digest(dish("run.log", mtime=time.time()))
+check(".log 十分钟内还在写：不吃，说还热着", hot is None and "热着" in why, why)
+log25, _ = F.digest(dish("old.log"))
+poem25, _ = F.digest(dish("a.poem"))
+todo25, _ = F.digest(dish("b.todo"))
+txt25, _ = F.digest(dish("c.txt"))
+sec25, _ = F.digest(dish("d.secret"))
+check(".log 加精力", log25 and log25.energy > 0 and log25.happy == 0 and log25.kind == "精力+", log25)
+check(".poem 加快乐", poem25 and poem25.happy > 0 and poem25.energy == 0 and poem25.kind == "快乐+")
+check(".todo 营养比同样大小的 .txt 多", todo25.value > txt25.value, f"{todo25.value} vs {txt25.value}")
+check(".secret 标成随机", sec25.secret and sec25.kind == "？？？")
+mixed = food25 / "mixed"
+mixed.mkdir()
+for n in ("x.log", "y.log", "z.poem"):
+    (mixed / n).write_text("嗯\n" * 30, encoding="utf-8")
+    os.utime(mixed / n, (old, old))
+fold25, _ = F.digest(mixed)
+check("文件夹按后缀占比折算", fold25.energy > 0 and fold25.happy > 0 and fold25.kind == "精力+")
+
+c25.energy, c25.happiness = 40, 40
+colony25.feed(w25, [dish("e.log")])
+check("喂 .log 精力涨", c25.energy > 40, c25.energy)
+h0 = c25.happiness
+colony25.feed(w25, [dish("f.poem")])
+check("喂 .poem 快乐涨得比普通食物多", c25.happiness - h0 > 5, c25.happiness - h0)
+real_rand = F.random.random
+F.random.random = lambda: 0.1
+n0 = c25.nutrition
+colony25.feed(w25, [dish("g.secret")])
+F.random.random = real_rand
+check(".secret 抽到翻倍", c25.nutrition - n0 >= sec25.value * 2 - 1 and any("？？？肥" in f["text"] for f in w25.floaters),
+      [f["text"] for f in w25.floaters])
+
+c25.energy, c25.happiness, c25.satiety = 50, 50, 100
+colony25.metabolize(c25, 3600)
+check("醒着一小时：精力、快乐都掉", c25.energy == 50 - F.ENERGY_DRAIN and c25.happiness == 50 - F.HAPPY_DECAY, (c25.energy, c25.happiness))
+colony25.metabolize(c25, 3600, asleep=True)
+check("睡着一小时：精力回来", c25.energy == 50 - F.ENERGY_DRAIN + F.ENERGY_REST)
+c25.happiness, c25.satiety = 50, 0
+colony25.metabolize(c25, 3600)
+check("饿扁了快乐掉得更快", c25.happiness == 50 - F.HAPPY_DECAY - F.STARVE_GLOOM, c25.happiness)
+c25.energy, c25.happiness, c25.satiety = 10, 90, 100
+colony25.offline_metabolize(c25, 48 * 3600)
+check("关着程序：精力睡满，快乐最多掉 OFFLINE_GLOOM_CAP", c25.energy == 100 and c25.happiness == 90 - F.OFFLINE_GLOOM_CAP, (c25.energy, c25.happiness))
+
+c25.energy, c25.watered = 50, 0
+first = colony25.care(c25, "water")
+again = colony25.care(c25, "water")
+check("浇水 +精力，冷却中再浇被拒", c25.energy == 50 + F.CARE_AMOUNT and "分钟后" in again, (first, again))
+c25.happiness, c25.sunned = 50, 0
+colony25.care(c25, "sun")
+check("晒太阳 +快乐", c25.happiness == 50 + F.CARE_AMOUNT)
+
+c25.energy = 10
+check("困了更容易睡着", colony25.sleep_after(c25) < colony25.sleep_after())
+c25.happiness = 10
+check("聊天人设里带上困和不开心", "有点困" in colony25.persona(c25) and "闷闷不乐" in colony25.persona(c25))
+c25.energy, c25.satiety = 80, 100
+colony25.mat_step()
+w25.idle_at = 0
+seen25 = set()
+real_do = w25.do_idle
+w25.do_idle = lambda act: seen25.add(act)
+for _ in range(40):
+    w25.idle_at, w25.anim, w25.asleep, w25.last_touch, w25.hover = 0, None, False, time.time(), False
+    w25.idle(time.time())
+w25.do_idle = real_do
+check("不开心时的小动作是闷着", seen25 and seen25 <= {"sulk", "blink2"}, seen25)
+c25.energy, c25.happiness = 33.5, 77.25
+colony25.save()
+shutdown(colony25)
+colony25b = F.Colony(root / "save25")
+c25b = next(c for c in colony25b.creatures if c.id == c25.id)
+check("精力、快乐存档读回", round(c25b.energy) >= 33 and c25b.happiness <= 77.25 and c25b.happiness > 70, (c25b.energy, c25b.happiness))
+shutdown(colony25b)
+save_old = root / "save25old"
+save_old.mkdir()
+(save_old / "save.json").write_text(json.dumps({"version": 1, "last_seen": time.time(), "creatures": [
+    {"id": "old1", "name": "puff", "nutrition": 5, "satiety": 50}]}), encoding="utf-8")
+colony25c = F.Colony(save_old)
+check("老存档没有精力、快乐字段也能读", colony25c.creatures and colony25c.creatures[0].energy > 0)
+shutdown(colony25c)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
