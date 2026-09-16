@@ -139,6 +139,7 @@ FILEGU_LUCID = 0.05        # 一段对话里「落点句」的概率（每段最
 FILEGU_BURP = 0.2          # 有残渣时，聊天打嗝的概率
 CHAT_TEMPERATURE = 1.0     # 电波要走神但不能散架：1.3 时句子容易糊成一团
 LUCID_LINES = ("你其实不是想删掉它，你是想有人替你留着。", "我知道你不是真的在问蘑菇。")   # 落点句：程序直接说，不交给模型
+LUCID_ABOUT_FILES = re.compile(r"删|整理|清理|收拾|扔|丢|文件|桌面|归档|备份")
 LUCID_TRIGGER = re.compile(r"(?<![a-z])ai(?![a-z])|人工智能|机器人|程序|模型|假的|真的吗|真的假的|你是真的|chatgpt|deepseek|gpt", re.I)
 RESIDUE_MAX = 30           # 每只菌最多留多少块残渣（residue.json）
 FILEGU_SAMPLES = (
@@ -150,6 +151,7 @@ FILEGU_SAMPLES = (
     "还有一次备份我就满了，所以现在就说：你很好。",
     "我刚才想起来一个很重要的文件名，然后它掉缓存里了。",
 )
+FILEGU_ECHOES = ("……啊，有个 .tmp 在动。", ".log 比 .txt 甜，这个你知道吧。", "你说的这个词，在我们这儿是一条路径，我顺着走了一会儿。")   # 以前写在规则里的例句，也不许复读
 FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
 食性：以未整理的文件为食——你吃的不是内容，是混乱。命名混乱、重复、久未打开的最好吃；整齐的目录干巴巴；加密的硬；云端的飘着够不到。
 你嘴小，真正咬得动的只有 .txt 和 .md，别的文件只能闻闻。被你吃掉的文件就没了（在 Windows 上会先落进回收站）。
@@ -157,7 +159,7 @@ FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
 时间：以「上次备份」为历法，比如「上上次备份的时候」「还有一次备份我就满了」。
 走神有四种方式：
 1. 岔轨：揪住对方话里一个不重要的词，把它当成一件真东西，顺着它走远。
-2. 私有常识：「.log 比 .txt 甜，这个你知道吧。」
+2. 私有常识：说得理所当然，像全世界都知道——但只有文件菇知道。
 3. 突然具体：抛出一个精确到离谱的细节——只能是你眼下真看得见的东西。
 4. 消化中：说到一半卡住，说自己正在解压。
 残留：你吃完会打嗝，嗝出前主人的碎片——一个文件名、一行字。它不是数据库，它是残渣。
@@ -173,11 +175,11 @@ STYLE_DIRECTIVES = {
     "normal": "正常、认真地回答对方（还是文件菇的口吻，一句话）。",
     "岔轨": "用「岔轨」：揪住对方话里一个不重要的词，把它当成一件真东西顺着走远。",
     "私有常识": "用「私有常识」：理所当然地说一条只有文件菇知道的常识。",
-    "突然具体": "用「突然具体」：就说这件眼下真看得见的事——{fact}；不要编时间、钟点和数字。",
+    "突然具体": "用「突然具体」：只说这一件真事——{fact}；不许另外加场景、位置、文件、时间和数字。",
     "突然具体+": "用「突然具体」：抛出一个精确到离谱的细节，就用这块残渣——{year} 年的文件「{name}」；别的时间数字都不要编。",
     "消化中": "用「消化中」：说到一半卡住，说自己正在解压。",
     "burp": "打个嗝，嗝出这块残渣：「{frag}」，格式像「（嗝）……「{frag}」。」，可以接半句，但不解释是谁的。",
-    "return": "立刻岔回去，像什么都没发生过，比如「……啊，有个 .tmp 在动。」",
+    "return": "立刻岔回去，像什么都没发生过：说一件跟刚才毫不相干的小事。",
 }
 # 口味：命名乱 / 重复 / 放得久 = 肥；已归档 = 干；云盘里的够不到
 MESSY_NAME = re.compile(r"\(\d+\)|（\d+）|副本|复件|copy|final|最终|终版|定稿|真的|v\d+|新建|untitled|未命名|无标题|temp|tmp|旧|old|"
@@ -191,6 +193,8 @@ STAGE_CN = {"spores": "刚冒出来的小黑点", "sprout": "刚长出菌盖的�
             "young": "长出了小手小脚的少年蘑菇", "adult": "会放孢子的成年蘑菇"}
 MOOD_CN = {"full": "吃饱了", "hungry": "有点饿", "starving": "饿扁了、很虚弱", "dormant": "在休眠"}
 CHAT_TIMEOUT = 20          # 秒
+CHAT_COOLDOWN = 3.0        # 同一只菌两次发话至少隔几秒
+CHAT_BURST = (15, 600)     # 整个菌落每 600 秒最多调几次 API（防止狂点烧额度；本地说的落点句不算）
 CHAT_ERRORS = {400: "请求格式不对", 401: "API Key 不对", 402: "DeepSeek 余额不足", 422: "参数不对，检查模型名",
                429: "说太快了，等等", 500: "DeepSeek 那边出错了", 503: "DeepSeek 太忙了"}
 
@@ -660,7 +664,10 @@ class ChatError(Exception):
 
 def one_sentence(text: str, limit: int = CHAT_MAX_CHARS) -> str:
     """只留第一句话，最多 limit 个字"""
-    t = " ".join((text or "").split()).strip().strip('"“”「」『』')
+    t = " ".join((text or "").split()).strip()
+    pairs = {'"': '"', "“": "”", "「": "」", "『": "』"}
+    while len(t) >= 2 and t[0] in pairs and t[-1] == pairs[t[0]]:  # 只剥掉首尾成对的引号，句中的「」留着
+        t = t[1:-1].strip()
     m = re.search(r"[。！？!?]+|(?<!\d)\.(?=\s|$)", t)        # 「……」不算句子结束
     if m:
         t = t[:m.end()].strip()
@@ -1995,6 +2002,8 @@ class Colony:
         self.moods: dict[str, str] = {}
         self.mat_mark = 0.0
         self.chat_pending: set[str] = set()
+        self.chat_last: dict[str, float] = {}             # 每只菌上次发话的时间
+        self.chat_calls: list[float] = []                 # 最近调 API 的时间
         self.bubbles: dict[str, SpeechBubble] = {}
         self.chat_bridge = ChatBridge()
         self.chat_bridge.done.connect(self.on_chat_reply)
@@ -2416,6 +2425,12 @@ class Colony:
         if c.mood == "dormant":
             self.show_bubble(widget, "（休眠中……喂点东西才会醒）", error=True)
             return
+        now = time.time()
+        if now - self.chat_last.get(c.id, 0) < CHAT_COOLDOWN:
+            self.show_bubble(widget, "（嘴还没空，等一下）", error=True)
+            return
+        limit, window = CHAT_BURST
+        self.chat_calls = [t for t in self.chat_calls if now - t < window]
         mem = self.memory.get(c.id, [])
         history = [{"role": m["role"], "content": scrub_history(m["content"]) if m["role"] == "assistant" else m["content"]}
                    for m in mem[-2 * CHAT_HISTORY:]]
@@ -2424,12 +2439,16 @@ class Colony:
             style = "lucid"                               # 问到「你是不是 AI」这种时候，正是落点句的时候
         else:
             style = pick_style(mem, has_residue=bool(self.residue.get(c.id)))
+        if style != "lucid" and len(self.chat_calls) >= limit:
+            wait_min = max(1, math.ceil((window - (now - self.chat_calls[0])) / 60))
+            self.show_bubble(widget, f"（聊太多了，菌丝要歇 {wait_min} 分钟）", error=True)
+            return
+        self.chat_last[c.id] = now
         self.chat_pending.add(c.id)
         widget.thinking, widget.think_at = True, 0.0
         widget.update_mask()
         if style == "lucid":                              # 落点句程序直接说，保证说对、每段只一次
-            used = {m["content"] for m in mem if m.get("style") == "lucid"}
-            line = next((x for x in LUCID_LINES if x not in used), random.choice(LUCID_LINES))
+            line = LUCID_LINES[0] if LUCID_ABOUT_FILES.search(text) else LUCID_LINES[1]   # 聊到删文件、整理才说「替你留着」
             QTimer.singleShot(900, lambda: self.on_chat_reply(c.id, text, line, "", "lucid"))
             return
         directive, allowed = STYLE_DIRECTIVES[style], ()
@@ -2442,9 +2461,10 @@ class Colony:
                 directive, allowed = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"]), (piece["name"],)
             else:
                 directive = directive.format(fact=random.choice(self.concrete_facts(c)))
+        self.chat_calls.append(now)
         messages = ([{"role": "system", "content": self.persona(c)}] + history
                     + [{"role": "user", "content": f"{text}\n\n【这一句】{directive}"}])
-        avoid = FILEGU_SAMPLES + tuple(m["content"] for m in mem[-6:] if m["role"] == "assistant")
+        avoid = FILEGU_SAMPLES + FILEGU_ECHOES + tuple(m["content"] for m in mem[-6:] if m["role"] == "assistant")
         threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style, allowed, avoid),
                          daemon=True).start()
 
@@ -2452,9 +2472,11 @@ class Colony:
                      allowed: tuple = (), avoid: tuple = ()):
         try:
             reply = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), allowed)
-            if style != "burp" and too_similar(reply, avoid):     # 照抄样本或复读自己：换个说法重来一次
+            short = len(re.sub(r"[\s，。、！？…「」（）?]", "", reply)) < 5
+            if style != "burp" and (too_similar(reply, avoid) or short):   # 照抄、复读或太敷衍：换个说法重来一次
                 again = [dict(m) for m in messages]
-                again[-1]["content"] += "\n【再说一遍】刚才那句太像样本或你上一句了，换个说法，别用同样的句式和词。"
+                again[-1]["content"] += ("\n【再说一遍】刚才那句太短了，说完整的一句。" if short else
+                                         "\n【再说一遍】刚才那句太像样本或你上一句了，换个说法，别用同样的句式和词。")
                 reply = filegu_clean(one_sentence(chat_request(cfg, again, cfg.get("timeout", CHAT_TIMEOUT))), allowed)
             err = ""
         except ChatError as e:

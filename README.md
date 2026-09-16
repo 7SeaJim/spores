@@ -6,9 +6,20 @@
 
 **最小闭环**：3×3 黑色方块 → 拖入文件 → 方块变大 → 变成蘑菇 → 放出新的 3×3 spores。
 
+## 下载（Windows）
+
+不想装 Python 的话，直接下载打包好的 `FUNGI.exe`，双击运行：
+
+- **正式版本**：仓库的 [Releases](https://github.com/7SeaJim/spores/releases) 页面（推送 `v*` 标签时自动发布）。
+- **最新构建**：仓库 [Actions](https://github.com/7SeaJim/spores/actions/workflows/build.yml) → 最近一次成功的运行 → 页面底部 Artifacts 里的 `FUNGI-windows`（需要登录 GitHub）。
+
+每次构建都会先在云端 Windows 上跑完整自测，再打包，再把 exe 实际启动 15 秒确认没崩。
+
+> Windows 可能提示「未知发布者」：exe 没有代码签名，点「更多信息 → 仍要运行」。存档在 `%APPDATA%\fungi`。
+
 ## 运行
 
-依赖：Python 3.10+、PyQt6（Debian: `sudo apt install python3-pyqt6`；Windows: `pip install PyQt6`，可选 `pip install send2trash`）。Linux 需要 X11 桌面并开合成器（XFCE 默认就开）。
+依赖：Python 3.10+，`pip install -r requirements.txt`（PyQt6；Windows 上另装 send2trash）。Debian 也可以 `sudo apt install python3-pyqt6`。Linux 需要 X11 桌面并开合成器（XFCE 默认就开）。
 
 > ⚠️ 默认开启**吞噬文件**：喂进去的 `.txt` / `.md` 会被真的吃掉（Linux 等直接删除，Windows 进回收站）。先试玩请用 `--data-dir /tmp/fungi-try` 并拿不要的文件喂，或右键关掉「吞噬文件」。
 
@@ -148,6 +159,7 @@ z 和孢子尘只把窗口可点击区域向上扩一条窄带，不会整窗挡
 - **会写进 JSON 的资料**：
   - `save.json` 里每只菌的 `parent`（母体；`spitter` 表示喷孢菌喷出来的）和 `chronicle` 大事记（最多 200 条）：出生、长大、饿得缩回、饿了 / 饿扁 / 休眠 / 被喂活、被喂食（只记份数和营养）、放孢子、喷孢菌长出、野孢子落地、菌斑、菌毯铺到 10% / 25% / 50% / 75% / 100%、放生。旧存档第一次读取时按代数和出生时间推断母体并补写出生记录。
   - `memory.json`（权限 600）：每只菌最近 40 条聊天，发请求时带最近 6 轮；重启不忘，放生时删除。
+- **不会狂烧额度**：同一只菌两次说话至少隔 3 秒；整个菌落 10 分钟最多调 15 次 API，超过了它会说「聊太多了，菌丝要歇几分钟」（程序自己说的落点句不算）。
 - **休眠孢子**不说话；出错时气泡里用括号说原因：API Key 不对 / DeepSeek 余额不足 / 说太快了 / 连不上… 等。请求在后台线程里发，20 秒超时，不会卡住桌面。
 
 ## 吞噬文件
@@ -220,3 +232,17 @@ QT_QPA_PLATFORM=offscreen python3 selftest.py [预览图输出目录]
 - HUNGER / ENERGY / HAPPINESS 数值和对应的照料按钮
 - 不同后缀不同营养效果（`.log` 能量+、`.poem` 快乐+、`.todo` 成长+、`.secret` ???）
 - 读文件内容决定口味、性格和变异；菌落之间的互动
+
+## 打包
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller packaging/fungi.spec --noconfirm     # 产物 dist/FUNGI.exe（在 Windows 上运行）
+```
+
+GitHub Actions（`.github/workflows/build.yml`）会在推送时自动完成：Linux 和 Windows 上跑自测 → Windows 上打包 → 启动冒烟测试 → 上传 exe；推送 `v*` 标签时发布到 Releases。
+
+## 许可
+
+- 本项目代码、像素画稿和宣传素材：**MIT**，见 [`LICENSE`](LICENSE)。
+- 打包好的 `FUNGI.exe` 里包含 PyQt6（GPL v3）、Qt 6（LGPL v3）等第三方组件，**分发 exe 时须遵守 GPL v3**（源码就在本仓库）。详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

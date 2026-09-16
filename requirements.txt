@@ -1,0 +1,2 @@
+PyQt6>=6.5
+send2trash>=1.8; sys_platform == "win32"

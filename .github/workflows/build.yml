@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Qt 运行库和中文字体
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 fonts-noto-cjk
+      - run: pip install -r requirements.txt
+      - name: 自测
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+        run: python selftest.py
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: 自测（Windows）
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: python selftest.py
+      - name: 打包 FUNGI.exe
+        run: pyinstaller packaging/fungi.spec --noconfirm
+      - name: 启动 15 秒冒烟测试
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "fungi-smoke"
+          $p = Start-Process -FilePath "dist\FUNGI.exe" -ArgumentList @("--data-dir", $data) -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { throw "FUNGI.exe 提前退出，退出码 $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          if (-not (Test-Path (Join-Path $data "save.json"))) { throw "FUNGI.exe 没有写出 save.json" }
+          "FUNGI.exe 启动正常，大小 {0:N1} MB" -f ((Get-Item dist\FUNGI.exe).Length / 1MB)
+      - name: 整理发布包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item dist\FUNGI.exe, LICENSE, THIRD_PARTY_NOTICES.md, README.md release\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FUNGI-windows
+          path: release/
+      - name: 发布到 Releases（推送 v* 标签时）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/FUNGI.exe
+            release/LICENSE
+            release/THIRD_PARTY_NOTICES.md

@@ -20,6 +20,15 @@ from PyQt6.QtWidgets import QApplication
 
 import fungi as F
 
+IS_WIN = sys.platform == "win32"
+REAL_FULLSCREEN = F.foreground_fullscreen
+F.foreground_fullscreen = lambda: False    # 云端 Windows 前台可能正好有全屏窗口，会把宠物藏起来；真实检测另测
+REAL_COOLDOWN = F.CHAT_COOLDOWN
+FRESH = __import__("itertools").cycle([      # 假模型：每次回一句不一样的话，免得被当成复读
+    "那团还没放够，先不碰。", "菌毯边上有点潮，我们在等。", "刚才那个词还蹲在左边。", "喷孢菌又鼓起来一小下。",
+    "这层回收站闻着像雨后。", "我们先在缓存里趴一会儿。", "桌面右上角那片还很干。", "底下那根菌丝换了个方向。"])
+F.CHAT_COOLDOWN = 0          # 前面各节会对同一只菌连发几句；第 20 节专门测冷却
+
 app = QApplication([])
 root = Path(tempfile.mkdtemp(prefix="fungi-test-"))
 out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else root
@@ -533,15 +542,29 @@ n = c11.nutrition
 colony11.feed(w11, [keep])
 check("保护区（程序目录、存档目录）里的不吃", keep.exists() and c11.nutrition == n and any("不能吃" in f["text"] for f in w11.floaters))
 check("程序目录默认受保护", colony11.is_protected(F.PROJECT_DIR / "fungi.py") and colony11.is_protected(root / "save12" / "save.json"))
-locked = dz / "locked"
-locked.mkdir()
-stuck = locked / "stuck.txt"
-stuck.write_text("s")
-os.chmod(locked, 0o555)
-n = c11.nutrition
-colony11.feed(w11, [stuck])
-os.chmod(locked, 0o755)
-check("删不掉就咬不动、不给营养", stuck.exists() and c11.nutrition == n and any("咬不动" in f["text"] for f in w11.floaters))
+if IS_WIN:                                  # Windows：真的进回收站；不装 send2trash 时走系统接口
+    via_api = dz / "进回收站.txt"
+    via_api.write_text("r")
+    saved_mod = sys.modules.get("send2trash")
+    sys.modules["send2trash"] = None
+    try:
+        F.devour_file(via_api)
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("send2trash", None)
+        else:
+            sys.modules["send2trash"] = saved_mod
+    check("Windows：不用 send2trash 也能把文件移进回收站", not via_api.exists())
+else:                                       # chmod 锁目录只在 POSIX 上有效
+    locked = dz / "locked"
+    locked.mkdir()
+    stuck = locked / "stuck.txt"
+    stuck.write_text("s")
+    os.chmod(locked, 0o555)
+    n = c11.nutrition
+    colony11.feed(w11, [stuck])
+    os.chmod(locked, 0o755)
+    check("删不掉就咬不动、不给营养", stuck.exists() and c11.nutrition == n and any("咬不动" in f["text"] for f in w11.floaters))
 colony11.devour = False
 again = dz / "again.txt"
 again.write_text("a" * 500)
@@ -676,7 +699,10 @@ F.foreground_fullscreen = lambda: True
 colony14.check_fullscreen()
 F.foreground_fullscreen = real_fs
 check("全屏检测接到隐藏", colony14.hidden_for_fullscreen)
-check("非 Windows 上不检测全屏", F.foreground_fullscreen() is False and not colony14.fullscreen_timer.isActive())
+if IS_WIN:
+    check("Windows：真实全屏检测能跑、定时检查已开启", REAL_FULLSCREEN() in (True, False) and colony14.fullscreen_timer.isActive())
+else:
+    check("非 Windows 上不检测全屏", REAL_FULLSCREEN() is False and not colony14.fullscreen_timer.isActive())
 shutdown(colony14)
 
 print("15. 聊天（DeepSeek）")
@@ -728,7 +754,7 @@ c15 = colony15.creatures[0]
 w15 = colony15.widgets[c15.id]
 check("没填 Key 时聊天未就绪", not colony15.chat_ready())
 colony15.save_chat_cfg({"api_key": "good", "base_url": fake_url, "model": "deepseek-flash", "thinking": False})
-check("Key 保存为仅本人可读（600）", stat.S_IMODE(os.stat(colony15.chat_path).st_mode) == 0o600 and colony15.chat_ready())
+check("Key 保存为仅本人可读（600）", (IS_WIN or stat.S_IMODE(os.stat(colony15.chat_path).st_mode) == 0o600) and colony15.chat_ready())
 c15.log = [[int(time.time()), "私密日记.md", 10]]
 colony15.send_chat(w15, "  你今天 吃了什么？ ")
 w15.idle(time.time())
@@ -850,7 +876,7 @@ check("被喂活写进大事记", f"{kino.name} 被喂饱，活过来了" in tex
 colony16.chat_pending.add(kino.id)
 colony16.on_chat_reply(kino.id, "你妈妈是谁", f"是 {mom.name} 呀！", "")
 mem_file = root / "save16" / "memory.json"
-check("聊天记忆写进 memory.json（仅本人可读）", stat.S_IMODE(os.stat(mem_file).st_mode) == 0o600
+check("聊天记忆写进 memory.json（仅本人可读）", (IS_WIN or stat.S_IMODE(os.stat(mem_file).st_mode) == 0o600)
       and json.loads(mem_file.read_text())[kino.id][-1]["content"] == f"是 {mom.name} 呀！")
 n_events = len(colony16.chronicle)
 family = {k.name: k.parent for k in colony16.creatures}
@@ -861,7 +887,7 @@ check("重启后大事记、母体都还在", len(colony17.chronicle) >= n_event
 kino2 = next(k for k in colony17.creatures if k.name == kino.name)
 captured = []
 real_request = F.chat_request
-F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or "嗯。"
+F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or next(FRESH)
 colony17.chat_cfg = {"api_key": "x"}
 colony17.send_chat(colony17.widgets[kino2.id], "还记得我问过什么吗")
 wait(0.6)
@@ -929,7 +955,7 @@ colony19.feed(w19, [snack])
 res = json.loads((root / "save19" / "residue.json").read_text())[c19.id][-1]
 check("吃掉前留下残渣：文件名、第一行、年份（residue.json 仅本人可读）",
       not snack.exists() and res["name"] == "aaa.txt" and res["line"] == "待办_旧_请勿删除" and res["year"] == 2019
-      and stat.S_IMODE(os.stat(root / "save19" / "residue.json").st_mode) == 0o600)
+      and (IS_WIN or stat.S_IMODE(os.stat(root / "save19" / "residue.json").st_mode) == 0o600))
 check("喂食飘字带口味，大事记记口味不记文件名", any("久放的" in f["text"] for f in w19.floaters)
       and "久放的" in colony19.chronicle[-1][1] and "aaa" not in colony19.chronicle[-1][1])
 colony19.burp(w19)
@@ -1020,7 +1046,7 @@ check("超长时在逗号处断开，不把词切一半", F.one_sentence("甲" *
 
 captured = []
 real_request = F.chat_request
-F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or "嗯。"
+F.chat_request = lambda cfg, messages, timeout=None: captured.append(messages) or next(FRESH)
 colony20.chat_cfg = {"api_key": "x"}
 colony20.send_chat(w20, "蘑菇蘑菇，你为什么说话像ai")
 wait(1.4)
@@ -1081,7 +1107,7 @@ colony21.send_chat(w21, "你在看什么")
 wait(0.6)
 directive = seen21[-1][-1]["content"]
 check("「突然具体」这一句：程序给真实细节，并禁止编时间数字",
-      "就说这件眼下真看得见的事——" in directive and "不要编时间" in directive
+      "只说这一件真事——" in directive and "不许另外加场景、位置、文件、时间和数字" in directive
       and any(f in directive for f in facts))
 
 seen21.clear()
@@ -1095,6 +1121,66 @@ check("照抄样本时会换个说法重来一次", len(seen21) == 2 and "【再
       and colony21.bubbles[c21.id].text == "那边那团还没放够，先不碰。")
 check("重来的那次仍然带着原来的提示", "【这一句】用「岔轨」" in seen21[-1][-1]["content"])
 shutdown(colony21)
+
+print("20. 聊天冷却（防止狂点烧额度）")
+F.CHAT_COOLDOWN = REAL_COOLDOWN
+colony22 = F.Colony(root / "save22")
+c22 = colony22.creatures[0]
+w22 = colony22.widgets[c22.id]
+colony22.chat_cfg = {"api_key": "x"}
+calls22, real_request, real_pick = [], F.chat_request, F.pick_style
+F.chat_request = lambda cfg, messages, timeout=None: calls22.append(1) or next(FRESH)
+F.pick_style = lambda *a, **k: "normal"
+colony22.send_chat(w22, "第一句")
+wait(0.3)
+colony22.send_chat(w22, "马上第二句")
+wait(0.3)
+check(f"同一只菌 {F.CHAT_COOLDOWN:.0f} 秒内再说话：不调 API，气泡提示", len(calls22) == 1 and "等一下" in colony22.bubbles[c22.id].text)
+limit, window = F.CHAT_BURST
+colony22.chat_calls = [time.time() - 10] * limit
+colony22.chat_last[c22.id] = 0
+colony22.send_chat(w22, "再来")
+wait(0.3)
+check(f"菌落 {window // 60} 分钟内满 {limit} 次：不调 API，提示歇几分钟", len(calls22) == 1 and "歇" in colony22.bubbles[c22.id].text)
+colony22.chat_last[c22.id] = 0
+colony22.send_chat(w22, "你是 AI 吧")
+wait(1.3)
+check("本地说的落点句不受次数限制", len(calls22) == 1 and colony22.bubbles[c22.id].text in F.LUCID_LINES)
+colony22.chat_calls = [time.time() - window - 1] * limit
+colony22.chat_last[c22.id] = 0
+colony22.send_chat(w22, "过了一阵")
+wait(0.5)
+F.chat_request, F.pick_style = real_request, real_pick
+check("过了时间窗口就能继续聊", len(calls22) == 2)
+shutdown(colony22)
+
+print("21. 真实 API 试聊后的修正")
+check("句中的「」不会被剥掉一半", F.one_sentence("「最近」是个什么味儿的东西。") == "「最近」是个什么味儿的东西。"
+      and F.one_sentence("「整句都在引号里。」") == "整句都在引号里。")
+colony23 = F.Colony(root / "save23")
+c23 = colony23.creatures[0]
+w23 = colony23.widgets[c23.id]
+colony23.chat_cfg = {"api_key": "x"}
+colony23.send_chat(w23, "我想把这些文件都删了，你是 AI 吧")
+wait(1.3)
+first = colony23.bubbles[c23.id].text
+colony23.memory[c23.id] = []
+colony23.chat_last[c23.id] = 0
+colony23.send_chat(w23, "你是不是机器人")
+wait(1.3)
+check("落点句看话题：聊到删文件说「替你留着」，否则说「不是真的在问蘑菇」",
+      first == F.LUCID_LINES[0] and colony23.bubbles[c23.id].text == F.LUCID_LINES[1])
+calls23, real_request, real_pick = [], F.chat_request, F.pick_style
+replies23 = iter(["嗯？", "嗯，明天我们还在这团里。"])
+F.chat_request = lambda cfg, messages, timeout=None: calls23.append(messages) or next(replies23)
+F.pick_style = lambda *a, **k: "return"
+colony23.chat_last[c23.id] = 0
+colony23.send_chat(w23, "明天见")
+wait(0.8)
+F.chat_request, F.pick_style = real_request, real_pick
+check("回得太短（「嗯？」）会让它说完整一句", len(calls23) == 2 and "太短" in calls23[-1][-1]["content"]
+      and colony23.bubbles[c23.id].text == "嗯，明天我们还在这团里。")
+shutdown(colony23)
 
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
