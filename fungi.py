@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import math
@@ -127,7 +128,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # 聊天：DeepSeek（OpenAI 兼容的 /chat/completions），API Key 由用户自己填
 CHAT_BASE_URL = "https://api.deepseek.com"
 CHAT_MODELS = ("deepseek-flash", "deepseek-v4-pro")
-CHAT_MAX_CHARS = 40        # 一句话最多几个字，超出截断
+CHAT_MAX_CHARS = 34        # 一句话最多几个字，超出截断
 CHAT_HISTORY = 6           # 每次聊天带上最近几轮对话
 CHAT_MEMORY = 40           # 每只菌在 memory.json 里最多记多少条消息
 CHRONICLE_MAX = 200        # 菌落大事记最多记多少条（存进 save.json）
@@ -140,37 +141,40 @@ CHAT_TEMPERATURE = 1.0     # 电波要走神但不能散架：1.3 时句子容�
 LUCID_LINES = ("你其实不是想删掉它，你是想有人替你留着。", "我知道你不是真的在问蘑菇。")   # 落点句：程序直接说，不交给模型
 LUCID_TRIGGER = re.compile(r"(?<![a-z])ai(?![a-z])|人工智能|机器人|程序|模型|假的|真的吗|真的假的|你是真的|chatgpt|deepseek|gpt", re.I)
 RESIDUE_MAX = 30           # 每只菌最多留多少块残渣（residue.json）
+FILEGU_SAMPLES = (
+    "我今天吃了半层回收站，有点撑，噗。",
+    "你桌面右下角那团，已经放到很好吃的程度了。",
+    "嗯咕……啊，你问的是上上次备份的事。",
+    "那个文件夹已归档了，干巴巴的，我们不碰。",
+    "稍等，正在解压，里面套了四层。",
+    "还有一次备份我就满了，所以现在就说：你很好。",
+    "我刚才想起来一个很重要的文件名，然后它掉缓存里了。",
+)
 FILEGU_STYLE = """【你是一只文件菇 · 说话方式：电波单句】
 食性：以未整理的文件为食——你吃的不是内容，是混乱。命名混乱、重复、久未打开的最好吃；整齐的目录干巴巴；加密的硬；云端的飘着够不到。
 你嘴小，真正咬得动的只有 .txt 和 .md，别的文件只能闻闻。被你吃掉的文件就没了（在 Windows 上会先落进回收站）。
 量词：一小口缓存、两指头临时文件、半层回收站、三个重复项那么远。夸东西用「未整理的」「松的」「久放的」；贬义只有一个词：「已归档。」
 时间：以「上次备份」为历法，比如「上上次备份的时候」「还有一次备份我就满了」。
 走神有四种方式：
-1. 岔轨到文件系统：揪住对方话里一个词，把它当成路径走掉。
+1. 岔轨：揪住对方话里一个不重要的词，把它当成一件真东西，顺着它走远。
 2. 私有常识：「.log 比 .txt 甜，这个你知道吧。」
-3. 突然具体：抛出一个精确到离谱的细节。
+3. 突然具体：抛出一个精确到离谱的细节——只能是你眼下真看得见的东西。
 4. 消化中：说到一半卡住，说自己正在解压。
 残留：你吃完会打嗝，嗝出前主人的碎片——一个文件名、一行字。它不是数据库，它是残渣。
 不许编文件名：除了【这一句】里明确给你的那块残渣，不要说出任何具体的文件名、网址、程序名；说到文件只说「那团」「那个文件夹」，或者 .txt、.log、.tmp 这样的后缀。
 硬规则：一句话，不解释，不找补。自称可以是「我」或「我们」。
 禁止：叠词、感叹号、颜文字；不说「数据」「算力」「赛博」这类词——你不懂这些，你只懂好不好吃。
+不许编：时间、钟点、日期、数字、地名、别人的经历——资料里没有的就说不知道，也别编得像真事。
 下面的资料是你心里模模糊糊知道的事：可以提到，但不要照着念，不要报数字、百分比、代数、坐标、英文代号。走神归走神，说到菌落里的成员和发生过的事时，不要和资料矛盾。
 对方的话后面会跟一行【这一句】，那是只给你看的说话提示：照做，但不要复述它。
-语气样本：
-- 我今天吃了半层回收站，有点撑，噗。
-- 你桌面右下角那团，已经放到很好吃的程度了。
-- 嗯咕……啊，你问的是上上次备份的事。
-- 那个文件夹已归档了，干巴巴的，我们不碰。
-- 稍等，正在解压，里面套了四层。
-- 你说的这个词，在我们这儿是一条路径，我顺着走了一会儿。
-- 还有一次备份我就满了，所以现在就说：你很好。
-- 我刚才想起来一个很重要的文件名，然后它掉缓存里了。"""
+语气样本（只是语气参考，读完就忘：不许照抄，也不许套它们的句式和词）：
+""" + "\n".join("- " + x for x in FILEGU_SAMPLES)
 STYLE_DIRECTIVES = {
     "normal": "正常、认真地回答对方（还是文件菇的口吻，一句话）。",
-    "岔轨": "用「岔轨到文件系统」：揪住对方话里一个词，把它当成路径走掉。",
+    "岔轨": "用「岔轨」：揪住对方话里一个不重要的词，把它当成一件真东西顺着走远。",
     "私有常识": "用「私有常识」：理所当然地说一条只有文件菇知道的常识。",
-    "突然具体": "用「突然具体」：抛出一个精确到离谱的细节。",
-    "突然具体+": "用「突然具体」：抛出一个精确到离谱的细节，就用这块残渣——{year} 年的文件「{name}」。",
+    "突然具体": "用「突然具体」：就说这件眼下真看得见的事——{fact}；不要编时间、钟点和数字。",
+    "突然具体+": "用「突然具体」：抛出一个精确到离谱的细节，就用这块残渣——{year} 年的文件「{name}」；别的时间数字都不要编。",
     "消化中": "用「消化中」：说到一半卡住，说自己正在解压。",
     "burp": "打个嗝，嗝出这块残渣：「{frag}」，格式像「（嗝）……「{frag}」。」，可以接半句，但不解释是谁的。",
     "return": "立刻岔回去，像什么都没发生过，比如「……啊，有个 .tmp 在动。」",
@@ -699,6 +703,22 @@ def session_styles(history: list[dict], now: float | None = None) -> list[str]:
         session.append(m.get("style", "normal"))
         prev = m.get("t", 0)
     return session
+
+
+def too_similar(reply: str, others) -> bool:
+    """回复是不是在照抄语气样本、或者复读自己上一句"""
+    strip = lambda t: re.sub(r"[\s，。、！？…「」『』（）()]", "", t or "")
+    r = strip(reply)
+    if len(r) < 6:
+        return False
+    for other in others:
+        o = strip(other)
+        if not o:
+            continue
+        m = difflib.SequenceMatcher(None, r, o)
+        if m.ratio() > 0.55 or m.find_longest_match(0, len(r), 0, len(o)).size >= 8:
+            return True
+    return False
 
 
 def pick_style(history: list[dict], has_residue: bool = False, now: float | None = None, rng=random) -> str:
@@ -2344,6 +2364,24 @@ class Colony:
                       lambda m: ("被喂了一口" if m.group(1) == "1" else "被喂了好几口") + (f"，{m.group(2)}" if m.group(2) else ""), text)
         return text
 
+    def concrete_facts(self, c: Creature) -> list[str]:
+        """「突然具体」能用的素材：全部来自存档，不让它自己编"""
+        facts = []
+        others = [o for o in self.creatures if o is not c]
+        if others:
+            near = min(others, key=lambda o: math.hypot(o.x - c.x, o.y - c.y))
+            facts += [f"{near.name} 就{self.where(c, near)}", f"{near.name} 现在{MOOD_CN[near.mood]}"]
+        facts.append("菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied()))
+        if self.patches:
+            facts.append("桌面中间那块菌斑还在慢慢摊开")
+        if self.spitter:
+            facts.append("菌毯上那只喷孢菌又在攒着要喷了")
+        age = time.time() - c.born
+        facts.append("你自己是" + ("刚冒出来不久" if age < 3600 else "冒出来有几个小时" if age < 86400 else "冒出来好几天") + "的那一只")
+        if self.chronicle:
+            facts.append(f"{self.ago(self.chronicle[-1][0])}刚发生过：{self.event_words(self.chronicle[-1][1])}")
+        return facts
+
     def persona(self, c: Creature) -> str:
         """聊天人设：固定规则在前（方便命中前缀缓存），再拼上此刻的自己、菌落成员、环境和最近发生的事——都用它自己的话，不报程序数字"""
         names = {o.id: o.name for o in self.creatures}
@@ -2398,16 +2436,27 @@ class Colony:
         if style == "burp":
             frag = self.fragment(self.pick_residue(c.id))
             directive, allowed = directive.format(frag=frag), (frag,)
-        elif style == "突然具体" and self.residue.get(c.id) and random.random() < 0.5:
-            piece = self.pick_residue(c.id)
-            directive, allowed = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"]), (piece["name"],)
+        elif style == "突然具体":
+            if self.residue.get(c.id) and random.random() < 0.5:
+                piece = self.pick_residue(c.id)
+                directive, allowed = STYLE_DIRECTIVES["突然具体+"].format(year=piece["year"], name=piece["name"]), (piece["name"],)
+            else:
+                directive = directive.format(fact=random.choice(self.concrete_facts(c)))
         messages = ([{"role": "system", "content": self.persona(c)}] + history
                     + [{"role": "user", "content": f"{text}\n\n【这一句】{directive}"}])
-        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style, allowed), daemon=True).start()
+        avoid = FILEGU_SAMPLES + tuple(m["content"] for m in mem[-6:] if m["role"] == "assistant")
+        threading.Thread(target=self._chat_worker, args=(c.id, text, messages, dict(self.chat_cfg), style, allowed, avoid),
+                         daemon=True).start()
 
-    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict, style: str = "normal", allowed: tuple = ()):
+    def _chat_worker(self, cid: str, text: str, messages: list[dict], cfg: dict, style: str = "normal",
+                     allowed: tuple = (), avoid: tuple = ()):
         try:
-            reply, err = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), allowed), ""
+            reply = filegu_clean(one_sentence(chat_request(cfg, messages, cfg.get("timeout", CHAT_TIMEOUT))), allowed)
+            if style != "burp" and too_similar(reply, avoid):     # 照抄样本或复读自己：换个说法重来一次
+                again = [dict(m) for m in messages]
+                again[-1]["content"] += "\n【再说一遍】刚才那句太像样本或你上一句了，换个说法，别用同样的句式和词。"
+                reply = filegu_clean(one_sentence(chat_request(cfg, again, cfg.get("timeout", CHAT_TIMEOUT))), allowed)
+            err = ""
         except ChatError as e:
             reply, err = "", str(e)
         self.chat_bridge.done.emit(cid, text, reply, err, style)

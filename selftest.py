@@ -1057,6 +1057,45 @@ check("旧对话里说漏的数字、编的文件名发出去前洗掉", F.scrub
       == "spores，磨着我一些的菌边，埋着 那个文件。")
 shutdown(colony20)
 
+print("19. 语气：不照抄样本、不编细节")
+check("照抄样本会被认出来", F.too_similar("我是 morel……你说的「谁」这个词，在我们这儿是一条路径，我顺着走了一会儿。",
+                                        F.FILEGU_SAMPLES + ("你说的这个词，在我们这儿是一条路径，我顺着走了一会儿。",)))
+check("自己复读上一句也认得出来", F.too_similar("那个文件夹已归档了，干巴巴的，我们不碰。", F.FILEGU_SAMPLES))
+check("新句子不会被误判", not F.too_similar("那团还没放够，先不碰。", F.FILEGU_SAMPLES))
+check(f"一句话截到 {F.CHAT_MAX_CHARS} 字", F.CHAT_MAX_CHARS <= 34 and len(F.one_sentence("甲" * 60)) == F.CHAT_MAX_CHARS)
+check("人设：样本注明不许照抄，并禁止编时间钟点数字", "不许照抄" in F.FILEGU_STYLE and "不许编：时间、钟点" in F.FILEGU_STYLE
+      and "当成路径走掉" not in F.FILEGU_STYLE)
+
+colony21 = F.Colony(root / "save21")
+c21 = colony21.creatures[0]
+w21 = colony21.widgets[c21.id]
+c21.nutrition, c21.satiety = F.STAGES[F.ADULT][1] + 1, 100
+colony21.after_growth(w21, 0)
+colony21.chat_cfg = {"api_key": "x"}
+facts = colony21.concrete_facts(c21)
+check("「突然具体」的素材全部来自存档", facts and all(any(k in f for k in ("就在你", "现在", "菌毯", "菌斑", "喷孢菌", "冒出来", "刚发生过")) for f in facts), facts[:2])
+seen21, real_request, real_pick = [], F.chat_request, F.pick_style
+F.chat_request = lambda cfg, messages, timeout=None: seen21.append(messages) or "那团在我们这儿，先放着。"
+F.pick_style = lambda *a, **k: "突然具体"
+colony21.send_chat(w21, "你在看什么")
+wait(0.6)
+directive = seen21[-1][-1]["content"]
+check("「突然具体」这一句：程序给真实细节，并禁止编时间数字",
+      "就说这件眼下真看得见的事——" in directive and "不要编时间" in directive
+      and any(f in directive for f in facts))
+
+seen21.clear()
+replies = iter(["稍等，正在解压，里面套了三层。", "那边那团还没放够，先不碰。"])   # 第一句几乎照抄样本
+F.chat_request = lambda cfg, messages, timeout=None: seen21.append(messages) or next(replies)
+F.pick_style = lambda *a, **k: "岔轨"
+colony21.send_chat(w21, "你刚才说什么")
+wait(1.0)
+F.chat_request, F.pick_style = real_request, real_pick
+check("照抄样本时会换个说法重来一次", len(seen21) == 2 and "【再说一遍】" in seen21[-1][-1]["content"]
+      and colony21.bubbles[c21.id].text == "那边那团还没放够，先不碰。")
+check("重来的那次仍然带着原来的提示", "【这一句】用「岔轨」" in seen21[-1][-1]["content"])
+shutdown(colony21)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30
