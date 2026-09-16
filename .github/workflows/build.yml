@@ -27,6 +27,10 @@ jobs:
         run: |
           set -o pipefail
           python selftest.py 2>&1 | tee selftest.log || { echo "::error title=自测日志末尾::$(tail -n 40 selftest.log | sed ':a;N;$!ba;s/\n/%0A/g')"; exit 1; }
+      - name: 多显示器自测
+        env:
+          PYTHONUTF8: "1"
+        run: python selftest_screens.py 2>&1 | grep -v "plugin does not support"; test "${PIPESTATUS[0]}" = 0
 
   windows:
     runs-on: windows-latest
@@ -50,6 +54,14 @@ jobs:
             Write-Output "::error title=自测日志末尾::$tail"
             exit $code
           }
+      - name: 多显示器自测（Windows）
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        shell: pwsh
+        run: |
+          python selftest_screens.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 打包 FUNGI.exe
         if: success() || failure()
         run: pyinstaller packaging/fungi.spec --noconfirm

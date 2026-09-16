@@ -1676,6 +1676,38 @@ class Mycelium:
         return m if len(m.d) == m.n else None
 
 
+def screen_key(screen) -> str:
+    """认屏幕：优先用系统给的名字（DISPLAY1、HDMI-1…），没有就用位置"""
+    if screen is None:
+        return "primary"
+    g = screen.geometry()
+    return screen.name() or f"{g.x()},{g.y()}"
+
+
+class MatField:
+    """一块屏幕上的菌毯：这块屏的可用区域 + 一圈菌丝 + 四条边的窗口"""
+
+    def __init__(self, key: str, rect: QRect, mat: "Mycelium | None" = None):
+        self.key, self.rect = key, QRect(rect)
+        cols, rows = max(1, rect.width() // PX), max(1, rect.height() // PX)
+        self.mat = mat.resized(cols, rows) if mat else Mycelium(cols, rows)
+        self.views: dict[str, MatStrip] = {}
+
+    def fit(self, rect: QRect) -> bool:
+        if rect == self.rect:
+            return False
+        self.rect = QRect(rect)
+        self.mat = self.mat.resized(max(1, rect.width() // PX), max(1, rect.height() // PX))
+        return True
+
+    def distance(self, x: float, y: float) -> float:
+        r = self.rect
+        return math.hypot(max(r.left() - x, 0, x - r.right()), max(r.top() - y, 0, y - r.bottom()))
+
+    def index_near(self, x: float, y: float) -> int:
+        return self.mat.nearest((x - self.rect.x()) / PX, (y - self.rect.y()) / PX)
+
+
 MAT_INK, MAT_DUST, MAT_PAPER, MAT_HALO = 0xFF111111, 0xFF55524C, 0xFFFAF9F4, 0xC8FAF9F4
 SPROUT_NAMES = ("mat_sprout", "mat_sprout_b", "mat_sprout_c", "mat_sprout_d")
 SPROUT_REACH = 5           # 小蘑菇（含描边）左右最多伸出几列
@@ -1818,7 +1850,7 @@ class SpitterWidget(QWidget):
         self.timer.start(50)
 
     def pose(self, now: float) -> tuple[str, int, int, tuple[int, int], bool]:
-        sp, m = self.colony.spitter, self.colony.mat
+        sp, m = self.colony.spitter, self.colony.spitter_field().mat
         edge = m.edge_of(sp["i"])[0]
         (ux, uy), rot = EDGE_POSE[edge]
         age = now - sp["born"]
@@ -1838,7 +1870,7 @@ class SpitterWidget(QWidget):
         return frame, rot, reveal, shake, starving
 
     def place(self):
-        c, m, sp = self.colony, self.colony.mat, self.colony.spitter
+        c, m, sp = self.colony, self.colony.spitter_field().mat, self.colony.spitter
         (ux, uy), rot = EDGE_POSE[m.edge_of(sp["i"])[0]]
         img = spitter_image("idle", rot)
         r = spitter_image("idle").height() / 2 - PX          # 根部中心到图中心的距离
@@ -2397,8 +2429,7 @@ class StatusPanel(QWidget):
             left = self.cooldown(stamp)
             btn.setEnabled(left == 0)
             btn.setText(name if left == 0 else f"{name} {left}m")
-        mat = self.colony.mat
-        cover = 100 * sum(1 for v in mat.d if v) / max(1, mat.n) if mat else 0.0
+        cover = 100 * self.colony.mat_occupied()
         self.info.setText(f"阶段  {c.stage_name}（{int(c.nutrition)}/{hi}）\n"
                           f"状态  {MOOD_CN[c.mood]}，{'有点困' if c.tired else '精神'}，"
                           f"{ {'gloomy': '闷闷不乐', 'cheery': '很开心', 'plain': '心情平平'}[c.spirit] }\n"
@@ -2450,9 +2481,11 @@ class Colony:
         self.shake = True
         self.sound = Sound(data_dir / "sounds")
         self.panels: dict[str, StatusPanel] = {}
-        self.mat: Mycelium | None = None
+        self.fields: dict[str, MatField] = {}            # 每块屏幕一圈菌毯，主屏在最前
+        self.primary_key = ""
+        self.stash: dict[str, dict] = {}                  # 暂时没接上的屏幕，它们的菌毯先存着
+        self.watched_screens: set[int] = set()
         self.mat_layer = "top"
-        self.mat_views: dict[str, MatStrip] = {}
         self.mat_acc = 0.0
         self.offline_elapsed = 0.0
         self.spitter: dict | None = None
@@ -2480,7 +2513,6 @@ class Colony:
         self.bubbles: dict[str, SpeechBubble] = {}
         self.chat_bridge = ChatBridge()
         self.chat_bridge.done.connect(self.on_chat_reply)
-        self.watched_screen = None
         self.screen_debounce = QTimer()
         self.screen_debounce.setSingleShot(True)
         self.screen_debounce.timeout.connect(self.on_screen_changed)
@@ -2514,8 +2546,10 @@ class Colony:
             self.fullscreen_timer.start(1500)
         app = QGuiApplication.instance()
         if app:
-            app.primaryScreenChanged.connect(self.watch_screen)
-        self.watch_screen(QGuiApplication.primaryScreen(), initial=True)
+            app.primaryScreenChanged.connect(self.schedule_screen_change)
+            app.screenAdded.connect(self.schedule_screen_change)
+            app.screenRemoved.connect(self.schedule_screen_change)
+        self.watch_screens()
         self.tray = self.make_tray()
 
     def sleep_after(self, c: Creature | None = None) -> float:
@@ -2549,8 +2583,11 @@ class Colony:
                 self.save_path.rename(broken)
                 print(f"[fungi] 存档损坏，已备份到 {broken}: {err}", file=sys.stderr)
         offline = 0.0
-        a = self.mat_area()
-        self.mat = Mycelium(a.width() // PX, a.height() // PX)
+        if data:
+            self.stash = {k: v for k, v in (data.get("mats") or {}).items() if isinstance(v, dict)}
+            if data.get("mat"):                            # 主屏那一圈（老存档只有这一圈）
+                self.stash[data.get("mat_screen") or screen_key(QGuiApplication.primaryScreen())] = data["mat"]
+        self.sync_fields()
         if data:
             self.name_i = data.get("name_i", 0)
             self.on_top = data.get("on_top", True)
@@ -2561,15 +2598,14 @@ class Colony:
             self.shake = bool(cfg.get("shake", True))
             self.sound.enabled = bool(cfg.get("sound", True))
             self.mat_layer = data.get("mat_layer", "top")
-            saved_mat = Mycelium.from_json(data.get("mat"))
-            if saved_mat:
-                self.mat = saved_mat.resized(self.mat.cols, self.mat.rows)
             self.patches = [Patch.from_dict(p) for p in data.get("patches", [])]
             sp = data.get("spitter")
             if sp and sp.get("edge") in EDGE_POSE:
-                length = self.mat.edge_len(sp["edge"])
+                key = sp.get("screen") if sp.get("screen") in self.fields else self.primary_key
+                m = self.fields[key].mat
+                length = m.edge_len(sp["edge"])
                 pos = min(length - 1, max(0, int(sp.get("frac", 0.5) * length)))
-                self.spitter = {"i": self.mat.index_at(sp["edge"], pos), "edge": sp["edge"], "frac": sp.get("frac", 0.5),
+                self.spitter = {"i": m.index_at(sp["edge"], pos), "edge": sp["edge"], "frac": sp.get("frac", 0.5), "screen": key,
                                 "born": sp.get("born", time.time()) - 99, "shots": sp.get("shots", 0),
                                 "stats": {k: sp.get("stats", {}).get(k, 0) for k in OUTCOME_NAMES},
                                 "next_at": time.time() + max(3.0, sp.get("next_in", 30) / self.passive_mult)}
@@ -2597,10 +2633,12 @@ class Colony:
         data = {"version": 1, "last_seen": time.time(), "name_i": self.name_i, "on_top": self.on_top, "devour": self.devour,
                 "config": {"growth_speed": self.growth_speed, "hunger_speed": self.hunger_speed, "shake": self.shake,
                            "sound": self.sound.enabled},
-                "mat_layer": self.mat_layer, "mat": self.mat.to_json(), "mat_mark": self.mat_mark,
+                "mat_layer": self.mat_layer, "mat": self.mat.to_json(), "mat_screen": self.primary_key,
+                "mats": {**self.stash, **{k: f.mat.to_json() for k, f in self.fields.items() if k != self.primary_key}},
+                "mat_mark": self.mat_mark,
                 "chronicle": self.chronicle,
                 "patches": [asdict(p) for p in self.patches],
-                "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats")}
+                "spitter": ({k: self.spitter[k] for k in ("edge", "frac", "born", "shots", "stats", "screen")}
                             | {"next_in": max(0.0, self.spitter["next_at"] - time.time()) * self.passive_mult})
                 if self.spitter else None,
                 "creatures": [asdict(c) for c in self.creatures]}
@@ -2631,35 +2669,90 @@ class Colony:
         while self.mat_acc >= MAT_TICK:
             self.mat_acc -= MAT_TICK
             self.mat_step()
-        if self.mat.dirty:
+        if any(f.mat.dirty for f in self.fields.values()):
             self.render_mat()
 
     # ── 屏幕变化（换主屏、改分辨率/缩放、挪任务栏）与全屏 ──
-    def watch_screen(self, screen, initial: bool = False):
-        if self.watched_screen is not None:
-            try:
-                self.watched_screen.availableGeometryChanged.disconnect(self.schedule_screen_change)
-            except (TypeError, RuntimeError):
-                pass
-        self.watched_screen = screen
-        if screen is not None:
-            screen.availableGeometryChanged.connect(self.schedule_screen_change)
-        if not initial:
-            self.schedule_screen_change()
+    def watch_screens(self):
+        for screen in QGuiApplication.screens():
+            if id(screen) not in self.watched_screens:
+                self.watched_screens.add(id(screen))
+                screen.availableGeometryChanged.connect(self.schedule_screen_change)
+                screen.destroyed.connect(lambda *_, k=id(screen): self.watched_screens.discard(k))
+
+    def screen_areas(self) -> list[tuple[str, QRect]]:
+        """每块屏幕的可用区域，主屏在最前"""
+        primary = QGuiApplication.primaryScreen()
+        areas = [(screen_key(primary), self.mat_area())]
+        for screen in QGuiApplication.screens():
+            if screen is not primary and screen_key(screen) not in dict(areas):
+                areas.append((screen_key(screen), screen.availableGeometry()))
+        return areas
+
+    def sync_fields(self) -> bool:
+        """按现在接着的屏幕增删菌毯：拔掉的屏幕先存起来，接回来接着长"""
+        areas = self.screen_areas()
+        changed = False
+        for key in [k for k in self.fields if k not in dict(areas)]:
+            self.stash[key] = self.fields.pop(key).mat.to_json()
+            changed = True
+        for key, rect in areas:
+            if key in self.fields:
+                changed |= self.fields[key].fit(rect)
+            else:
+                self.fields[key] = MatField(key, rect, Mycelium.from_json(self.stash.pop(key, None)))
+                changed = True
+        self.fields = {k: self.fields[k] for k, _ in areas}
+        self.primary_key = areas[0][0]
+        return changed
+
+    @property
+    def mat(self) -> Mycelium | None:
+        """主屏那一圈"""
+        f = self.fields.get(self.primary_key)
+        return f.mat if f else None
+
+    @mat.setter
+    def mat(self, m: Mycelium):
+        self.fields[self.primary_key].mat = m
+
+    @property
+    def mat_views(self) -> dict[str, MatStrip]:
+        f = self.fields.get(self.primary_key)
+        return f.views if f else {}
+
+    def all_mat_views(self) -> list[MatStrip]:
+        return [v for f in self.fields.values() for v in f.views.values()]
+
+    def field_at(self, x: float, y: float) -> MatField:
+        """(x, y) 所在屏幕的菌毯；在屏幕缝里就找最近的"""
+        return min(self.fields.values(), key=lambda f: f.distance(x, y))
+
+    def field_of(self, c: Creature) -> MatField:
+        return self.field_at(c.x, c.y - 8)
+
+    def spitter_field(self) -> MatField:
+        return self.fields.get(self.spitter.get("screen")) if self.spitter and self.spitter.get("screen") in self.fields \
+            else self.fields[self.primary_key]
+
+    def mat_occupied(self) -> float:
+        """长得最满的那块屏幕，边缘一圈有菌毯的占比"""
+        return max((f.mat.occupied() for f in self.fields.values()), default=0.0)
 
     def schedule_screen_change(self, *_):
         self.screen_debounce.start(400)                  # 这类信号常常一次来好几个
 
     def on_screen_changed(self):
         """按新的桌面可用区域重新铺菌毯；跑到屏幕外的宠物拉回来"""
-        a = self.mat_area()
-        cols, rows = a.width() // PX, a.height() // PX
-        if (cols, rows) != (self.mat.cols, self.mat.rows):
-            self.mat = self.mat.resized(cols, rows)
-            if self.spitter:
-                sp = self.spitter
-                length = self.mat.edge_len(sp["edge"])
-                sp["i"] = self.mat.index_at(sp["edge"], min(length - 1, int(sp["frac"] * length)))
+        self.watch_screens()
+        self.sync_fields()
+        if self.spitter:
+            sp = self.spitter
+            if sp.get("screen") not in self.fields:           # 它那块屏拔掉了：先挪到主屏同样的位置
+                sp["screen"] = self.primary_key
+            m = self.spitter_field().mat
+            length = m.edge_len(sp["edge"])
+            sp["i"] = m.index_at(sp["edge"], min(length - 1, int(sp["frac"] * length)))
         for c in self.creatures:
             if QGuiApplication.screenAt(QPoint(c.x, c.y - 8)) is None:
                 c.x, c.y = self.default_spot()
@@ -2678,7 +2771,7 @@ class Colony:
     def set_fullscreen_hidden(self, hidden: bool):
         """前台全屏时把菌毯、菌斑、喷孢菌和宠物都藏起来，退出全屏再出来（期间照样长）"""
         self.hidden_for_fullscreen = hidden
-        views = list(self.mat_views.values()) + list(self.patch_views.values()) + [self.spitter_view] + list(self.widgets.values())
+        views = self.all_mat_views() + list(self.patch_views.values()) + [self.spitter_view] + list(self.widgets.values())
         for v in views:
             if v:
                 v.setVisible(not hidden)
@@ -2907,7 +3000,7 @@ class Colony:
         if re.search(r"喜欢|爱你|想你", text):
             return "喜欢，你桌面乱得刚刚好。"
         if re.search(r"菌毯|孢子|菌斑|喷孢菌", text):
-            return "菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied()) + "，还在往前摸。"
+            return "菌毯沿着屏幕边上" + self.ring_words(self.mat_occupied()) + "，还在往前摸。"
         if re.search(r"你好|在吗|在不在|hi|hello|嗨", text, re.I):
             return "在，我们一直趴在这儿。"
         return ""
@@ -2919,7 +3012,7 @@ class Colony:
         if others:
             near = min(others, key=lambda o: math.hypot(o.x - c.x, o.y - c.y))
             facts += [f"{near.name} 就{self.where(c, near)}", f"{near.name} 现在{MOOD_CN[near.mood]}"]
-        facts.append("菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied()))
+        facts.append("菌毯沿着屏幕边上" + self.ring_words(self.mat_occupied()))
         if self.patches:
             facts.append("桌面中间那块菌斑还在慢慢摊开")
         if self.spitter:
@@ -2940,7 +3033,7 @@ class Colony:
         fed = "还没被喂过" if not c.feeds else "被喂过几口" if c.feeds < 5 else "被喂过好多次"
         others = [f"- {o.name}：{self.relation(c, o)}，{STAGE_CN[o.stage_name]}，{MOOD_CN[o.mood]}，{self.where(c, o)}"
                   for o in self.creatures if o is not c]
-        world = ["菌毯沿着屏幕边上" + self.ring_words(self.mat.occupied())]
+        world = ["菌毯沿着屏幕边上" + self.ring_words(self.mat_occupied())]
         if self.spitter:
             world.append("菌毯上长着一只不会动的喷孢菌，隔一阵就往外喷孢子，大多散掉了")
         if self.patches:
@@ -3120,26 +3213,32 @@ class Colony:
         return screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
 
     def mat_index(self, c: Creature) -> int:
-        a = self.mat_area()
-        return self.mat.nearest((c.x - a.x()) / PX, (c.y - a.y()) / PX)
+        """离它最近的菌毯格子（在它自己那块屏幕上）"""
+        return self.field_of(c).index_near(c.x, c.y)
 
     def mat_step(self):
-        vigor = 0.0
+        vigor, per = 0.0, {k: 0.0 for k in self.fields}
         for c in self.creatures:
             v = MAT_VIGOR[c.stage] * c.growth_factor * (0.8 + 0.4 * c.happiness / 100)   # 开心的菌落长得快一点
             vigor += v
-            if random.random() < MAT_SEED * v and self.mat.seed(self.mat_index(c)):
+            f = self.field_of(c)
+            per[f.key] += v                               # 每块屏幕的菌毯靠待在这块屏上的菌
+            if random.random() < MAT_SEED * v and f.mat.seed(f.index_near(c.x, c.y)):
                 w = self.widgets.get(c.id)
                 if w and c.stage and not w.asleep:
                     w.puff(2)
-        budget = MAT_RATE * vigor if vigor else MAT_RECEDE
-        steps = int(budget) + (random.random() < budget % 1)
+        for f in self.fields.values():
+            budget = MAT_RATE * per[f.key] if vigor else MAT_RECEDE
+            steps = int(budget) + (random.random() < budget % 1)
+            if not steps:
+                continue
+            if vigor:
+                f.mat.grow(steps)
+            else:
+                f.mat.shrink(steps)                       # 全体饿扁：菌毯慢慢退
         if vigor:
-            self.mat.grow(steps)
             self.grow_patches(PATCH_GROW * (0.5 + min(vigor, 6) / 6))
-        else:
-            self.mat.shrink(steps)                        # 全体饿扁：菌毯慢慢退
-        occupied = self.mat.occupied()
+        occupied = self.mat_occupied()
         for mark in MAT_MILESTONES:
             if occupied >= mark > self.mat_mark:
                 self.log_event("菌毯沿着屏幕边上" + self.ring_words(mark))
@@ -3152,35 +3251,43 @@ class Colony:
         steps = elapsed * self.passive_mult / MAT_TICK
         if steps < 1:
             return
+        per = {k: 0.0 for k in self.fields}
         for c in self.creatures:
+            f = self.field_of(c)
+            per[f.key] += MAT_VIGOR[c.stage] * c.growth_factor
             if random.random() < 1 - (1 - MAT_SEED * MAT_VIGOR[c.stage] * c.growth_factor) ** steps:
-                self.mat.seed(self.mat_index(c))
-        vigor = sum(MAT_VIGOR[c.stage] * c.growth_factor for c in self.creatures)
+                f.mat.seed(f.index_near(c.x, c.y))
+        vigor = sum(per.values())
+        for f in self.fields.values():
+            if vigor:
+                f.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * per[f.key])))
+            else:
+                f.mat.shrink(int(min(MAT_OFFLINE_CAP, steps * MAT_RECEDE)))
         if vigor:
-            self.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * vigor)))
             self.grow_patches(steps * PATCH_GROW * (0.5 + min(vigor, 6) / 6))
-        else:
-            self.mat.shrink(int(min(MAT_OFFLINE_CAP, steps * MAT_RECEDE)))
         self.check_spitter(quiet=True)
 
     def build_mat_views(self):
-        old = list(self.mat_views.values()) + list(self.patch_views.values()) + [self.spitter_view]
+        old = self.all_mat_views() + list(self.patch_views.values()) + [self.spitter_view]
         for v in old:
             if v:
                 v.close()
-        self.mat_views, self.patch_views, self.spitter_view = {}, {}, None
+        for f in self.fields.values():
+            f.views = {}
+        self.patch_views, self.spitter_view = {}, None
         if self.mat_layer != "hidden":
-            a, m, t = self.mat_area(), self.mat, MAT_STRIP * PX
-            w, h = m.cols * PX, m.rows * PX
-            rects = {"top": QRect(a.x(), a.y(), w, t), "bottom": QRect(a.x(), a.y() + h - t, w, t),
-                     "left": QRect(a.x(), a.y(), t, h), "right": QRect(a.x() + w - t, a.y(), t, h)}
-            self.mat_views = {edge: MatStrip(edge, rect, self.mat_layer) for edge, rect in rects.items()}
+            t = MAT_STRIP * PX
+            for f in self.fields.values():
+                a, w, h = f.rect, f.mat.cols * PX, f.mat.rows * PX
+                rects = {"top": QRect(a.x(), a.y(), w, t), "bottom": QRect(a.x(), a.y() + h - t, w, t),
+                         "left": QRect(a.x(), a.y(), t, h), "right": QRect(a.x() + w - t, a.y(), t, h)}
+                f.views = {edge: MatStrip(edge, rect, self.mat_layer) for edge, rect in rects.items()}
             self.render_mat(full=True)
             for p in self.patches:
                 self.add_patch_view(p)
             if self.spitter:
                 self.spitter_view = SpitterWidget(self, self.mat_layer)
-            for v in list(self.mat_views.values()) + [self.spitter_view]:
+            for v in self.all_mat_views() + [self.spitter_view]:
                 if v and not self.hidden_for_fullscreen:
                     v.show()
         for w in self.widgets.values():
@@ -3206,7 +3313,8 @@ class Colony:
 
     def mat_at(self, x: float, y: float):
         """孢子在 (x, y) 落地形成菌毯：贴边就加厚边缘菌毯，打中已有菌斑就让它长大，否则长出新菌斑"""
-        a, m = self.mat_area(), self.mat
+        f = self.field_at(x, y)
+        a, m = f.rect, f.mat
         cx, cy = (x - a.x()) / PX, (y - a.y()) / PX
         if min(cx, cy, m.cols - 1 - cx, m.rows - 1 - cy) < MAT_MAX + 4:
             i = m.nearest(cx, cy)
@@ -3233,21 +3341,26 @@ class Colony:
         return random.uniform(*SPITTER_EVERY) / self.passive_mult
 
     def check_spitter(self, quiet: bool = False):
-        m = self.mat
-        if self.spitter or m.occupied() < SPITTER_AT:
+        if self.spitter:
             return
-        cands = [i for i in m.active if m.d[i] >= MAT_SPROUT_DEPTH
-                 and 12 <= m.edge_of(i)[1] < m.edge_len(m.edge_of(i)[0]) - 12]
-        if not cands:
-            return
-        cands.sort(key=lambda i: m.eff(i) + random.random() * 2, reverse=True)
-        self.plant_spitter(random.choice(cands[:20]), quiet)
+        for f in self.fields.values():                    # 主屏优先
+            m = f.mat
+            if m.occupied() < SPITTER_AT:
+                continue
+            cands = [i for i in m.active if m.d[i] >= MAT_SPROUT_DEPTH
+                     and 12 <= m.edge_of(i)[1] < m.edge_len(m.edge_of(i)[0]) - 12]
+            if cands:
+                cands.sort(key=lambda i: m.eff(i) + random.random() * 2, reverse=True)
+                self.plant_spitter(random.choice(cands[:20]), quiet, screen=f.key)
+                return
 
-    def plant_spitter(self, i: int, quiet: bool = False):
-        m = self.mat
+    def plant_spitter(self, i: int, quiet: bool = False, screen: str = ""):
+        screen = screen if screen in self.fields else self.primary_key
+        m = self.fields[screen].mat
         edge, pos = m.edge_of(i)
         now = time.time()
         self.spitter = {"i": i % m.n, "edge": edge, "frac": (pos + 0.5) / m.edge_len(edge), "born": now - (99 if quiet else 0),
+                        "screen": screen,
                         "shots": 0, "stats": {k: 0 for k in OUTCOME_NAMES}, "next_at": now + 3 + self.shot_gap()}
         self.log_event("屏幕边缘的菌毯上长出了一只喷孢菌")
         if self.mat_layer != "hidden":
@@ -3262,7 +3375,8 @@ class Colony:
 
     def spitter_base(self) -> tuple[float, float]:
         """喷孢菌根部中心的屏幕坐标：埋进菌毯表面下 2 格"""
-        a, m, i = self.mat_area(), self.mat, self.spitter["i"]
+        f = self.spitter_field()
+        a, m, i = f.rect, f.mat, self.spitter["i"]
         edge, pos = m.edge_of(i)
         w, h = m.cols * PX, m.rows * PX
         u, v = (pos + 0.5) * PX, max(0.0, m.eff(i) - 2) * PX
@@ -3278,7 +3392,7 @@ class Colony:
         return SHOT_OUTCOMES[-1][0]
 
     def shot_target(self, start: tuple[float, float]) -> tuple[float, float]:
-        a = self.mat_area()
+        a = self.spitter_field().rect if self.spitter else self.mat_area()
         pt = start
         for _ in range(12):
             pt = (random.uniform(a.left() + 40, a.right() - 40), random.uniform(a.top() + 40, a.bottom() - 40))
@@ -3296,7 +3410,7 @@ class Colony:
 
     def shoot(self, outcome: str | None = None, target: tuple[float, float] | None = None) -> SporeShot:
         sp, now = self.spitter, time.time()
-        (ux, uy), _ = EDGE_POSE[self.mat.edge_of(sp["i"])[0]]
+        (ux, uy), _ = EDGE_POSE[self.spitter_field().mat.edge_of(sp["i"])[0]]
         bx, by = self.spitter_base()
         reach = spitter_image("idle").height() - 2 * PX
         start = (bx + ux * reach, by + uy * reach)
@@ -3359,21 +3473,22 @@ class Colony:
         m.exec(pos)
 
     def render_mat(self, full: bool = False):
-        m = self.mat
-        if full:
-            todo = {j % m.n for i in m.active for j in range(i - 12, i + 13)}
-        else:
-            todo = m.dirty
-        m.dirty = set()
-        if not self.mat_views:
-            return
-        touched = set()
-        for i in todo:
-            edge = m.edge_of(i)[0]
-            self.mat_views[edge].render_column(m, i)
-            touched.add(edge)
-        for edge in touched:
-            self.mat_views[edge].update()
+        for f in self.fields.values():
+            m = f.mat
+            if full:
+                todo = {j % m.n for i in m.active for j in range(i - 12, i + 13)}
+            else:
+                todo = m.dirty
+            m.dirty = set()
+            if not f.views:
+                continue
+            touched = set()
+            for i in todo:
+                edge = m.edge_of(i)[0]
+                f.views[edge].render_column(m, i)
+                touched.add(edge)
+            for edge in touched:
+                f.views[edge].update()
 
     def set_mat_layer(self, layer: str):
         self.mat_layer = layer
@@ -3392,7 +3507,9 @@ class Colony:
             group.addAction(act)
 
         def refresh():
-            sub.setTitle(f"菌毯  {self.mat.coverage() * 100:.1f}%" + (f" · 菌斑 {len(self.patches)}" if self.patches else ""))
+            cover = sum(f.mat.coverage() * f.mat.n for f in self.fields.values()) / max(1, sum(f.mat.n for f in self.fields.values()))
+            sub.setTitle(f"菌毯  {cover * 100:.1f}%" + (f" · {len(self.fields)} 块屏" if len(self.fields) > 1 else "")
+                         + (f" · 菌斑 {len(self.patches)}" if self.patches else ""))
             for act, key in zip(group.actions(), ("top", "bottom", "hidden")):
                 act.setChecked(self.mat_layer == key)
         refresh()
@@ -3448,8 +3565,9 @@ class Colony:
             c.feeds += 1
             c.log = (c.log + [[int(time.time()), food.label, value]])[-50:]
             eaten.append((value, note))
-        if eaten and self.mat.active:
-            self.mat.grow(int(sum(v for v, _ in eaten) * MAT_FEED), near=self.mat_index(c))
+        home = self.field_of(c)
+        if eaten and home.mat.active:
+            home.mat.grow(int(sum(v for v, _ in eaten) * MAT_FEED), near=home.index_near(c.x, c.y))
             self.render_mat()
         if len(paths) > MAX_ITEMS_PER_DROP:
             rejected.append("吃不下了")
@@ -3699,7 +3817,9 @@ class Colony:
             w.close()
         self.widgets.clear()
         self.creatures, self.name_i = [], 0
-        self.mat = Mycelium(self.mat.cols, self.mat.rows)
+        for f in self.fields.values():
+            f.mat = Mycelium(f.mat.cols, f.mat.rows)
+        self.stash = {}
         self.spitter, self.patches = None, []
         self.chronicle, self.moods, self.mat_mark, self.memory = [], {}, 0.0, {}
         self.save_memory()
