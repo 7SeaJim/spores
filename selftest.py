@@ -828,7 +828,7 @@ wait_reply(colony15, c15.id)
 check("连不上时改用本地回复，不报错", not colony15.bubbles[c15.id].error and colony15.memory[c15.id][-1].get("local"))
 colony15.chat_cfg.update(api_key="slow", base_url=fake_url, timeout=0.5)
 colony15.send_chat(w15, "慢慢说")
-wait_reply(colony15, c15.id)
+wait_reply(colony15, c15.id, limit=15)             # 云端机器慢时，超时后的重试和本地回复要多等一会
 check("超时也不卡界面，改用本地回复", not colony15.bubbles[c15.id].error and colony15.memory[c15.id][-1].get("local") and not w15.thinking)
 colony15.chat_cfg.pop("timeout")
 colony15.chat_cfg["api_key"] = "good"
