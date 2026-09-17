@@ -1,6 +1,6 @@
 # 第三方组件许可 · Third-party notices
 
-FUNGI.EXE 自己的代码和像素画稿（`fungi.py`、`selftest.py`、`art/`、`promo/`、`packaging/`）使用 MIT 许可，见 `LICENSE`。
+FUNGI.EXE 自己的代码和像素画稿（`main.py`、`fungi/`、`selftest.py`、`selftest_screens.py`、`art/`、`promo/`、`packaging/`）使用 MIT 许可，见 `LICENSE`。
 
 打包好的 `FUNGI.exe` 里还包含下面这些组件，它们各自保留原来的许可。**因为 PyQt6 使用 GPLv3，分发打包好的 `FUNGI.exe` 时须遵守 GPLv3**：本项目完整源码公开在 https://github.com/7SeaJim/spores ，MIT 与 GPLv3 兼容。
 

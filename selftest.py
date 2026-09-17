@@ -558,7 +558,7 @@ colony11.protected_dirs.append(safe.resolve())
 n = c11.nutrition
 colony11.feed(w11, [keep])
 check("保护区（程序目录、存档目录）里的不吃", keep.exists() and c11.nutrition == n and any("不能吃" in f["text"] for f in w11.floaters))
-check("程序目录默认受保护", colony11.is_protected(F.PROJECT_DIR / "fungi.py") and colony11.is_protected(root / "save12" / "save.json"))
+check("程序目录默认受保护", colony11.is_protected(F.PROJECT_DIR / "fungi" / "config.py") and colony11.is_protected(root / "save12" / "save.json"))
 if IS_WIN:                                  # Windows：真的进回收站；不装 send2trash 时走系统接口
     via_api = dz / "进回收站.txt"
     via_api.write_text("r")

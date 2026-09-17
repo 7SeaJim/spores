@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""小红书宣传图（1080×1440）+ 效果动图。画面全部用 fungi.py 自己的渲染函数生成。
+"""小红书宣传图（1080×1440）+ 效果动图。画面全部用 fungi 包自己的渲染函数生成。
 
     QT_QPA_PLATFORM=offscreen python3 promo/make_promo.py            # 图片
     QT_QPA_PLATFORM=offscreen python3 promo/make_promo.py --gif      # 再加动图

@@ -5,7 +5,7 @@ from pathlib import Path
 root = Path(SPECPATH).parent
 
 a = Analysis(
-    [str(root / "fungi.py")],
+    [str(root / "main.py")],
     pathex=[str(root)],
     datas=[(str(root / "art" / "*.pxl"), "art")],
     hiddenimports=["send2trash"],
