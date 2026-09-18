@@ -1577,6 +1577,33 @@ colony27.salt_overlays[0].tick()
 check("忘了退出：一阵子没动自己关掉", not colony27.salt_overlays and colony27.salt_bar is None)
 shutdown(colony27)
 
+print("26. 长时间不喂：菌毯退但不退光，喷孢菌跟着枯")
+colony28 = F.Colony(root / "save28")
+c28 = colony28.creatures[0]
+c28.nutrition, c28.satiety = F.STAGES[F.ADULT][1] + 1, 0
+colony28.after_growth(colony28.widgets[c28.id], 0, quiet=True)
+m28 = colony28.mat
+for k in range(m28.n):
+    for _ in range(F.MAT_SPROUT_DEPTH):
+        m28.bump(k)
+colony28.check_spitter(quiet=True)
+check("先长满一圈、长出喷孢菌", m28.occupied() == 1 and colony28.spitter)
+for d in colony28.creatures:                                  # 全体饿扁
+    d.nutrition, d.satiety = 0, 0
+before28 = sum(m28.d)
+colony28.grow_mat_offline(40 * 3600)                          # 关了 40 小时
+left28 = sum(m28.d)
+check("关 40 小时回来：菌毯退了，但没退光", before28 * 0.6 < left28 < before28, (before28, left28))
+for _ in range(6):
+    colony28.grow_mat_offline(40 * 3600)
+check("再关几个 40 小时：一直退，但总留着一点", 0 < sum(m28.d) < left28, sum(m28.d))
+m28.d = bytearray(m28.n)                                      # 真的退光了
+m28.active = []
+colony28.check_spitter()
+check("菌毯退光：喷孢菌枯掉，不留光杆", colony28.spitter is None and colony28.spitter_view is None
+      and any("枯掉" in e[1] for e in colony28.chronicle))
+shutdown(colony28)
+
 # ── 预览图 ──
 shots = [("spores · 3×3", spore_grab), ("吃东西", eat_grab), ("adult · 悬停", adult_grab), ("拖入中", drag_grab)]
 W = sum(max(160, s.width()) + 30 for _, s in shots) + 30

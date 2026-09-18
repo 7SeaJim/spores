@@ -9,8 +9,8 @@ from PyQt6.QtCore import QRect
 from PyQt6.QtGui import QActionGroup, QGuiApplication
 from PyQt6.QtWidgets import QMenu
 
-from .config import (MAT_MAX, MAT_MILESTONES, MAT_OFFLINE_CAP, MAT_RATE, MAT_RECEDE, MAT_SEED, MAT_STRIP, MAT_TICK,
-                     MAT_VIGOR, MAX_PATCHES, PATCH_GROW, PATCH_MAX, PX)
+from .config import (MAT_MAX, MAT_MILESTONES, MAT_OFFLINE_CAP, MAT_OFFLINE_RECEDE, MAT_RATE, MAT_RECEDE, MAT_SEED,
+                     MAT_STRIP, MAT_TICK, MAT_VIGOR, MAX_PATCHES, PATCH_GROW, PATCH_MAX, PX)
 from .model import Creature
 from .ui import MENU_QSS
 from .mat import MatField, MatStrip, Mycelium, screen_key
@@ -134,8 +134,8 @@ class MatMixin:
         for f in self.fields.values():
             if vigor:
                 f.mat.grow(int(min(MAT_OFFLINE_CAP, steps * MAT_RATE * per[f.key])))
-            else:
-                f.mat.shrink(int(min(MAT_OFFLINE_CAP, steps * MAT_RECEDE)))
+            else:                                          # 全体饿扁：退，但一次最多退掉现有的一部分
+                f.mat.shrink(int(min(MAT_OFFLINE_CAP, steps * MAT_RECEDE, sum(f.mat.d) * MAT_OFFLINE_RECEDE)))
         if vigor:
             self.grow_patches(steps * PATCH_GROW * (0.5 + min(vigor, 6) / 6))
         self.check_spitter(quiet=True)

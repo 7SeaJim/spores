@@ -86,6 +86,8 @@ SALT_RADIUS = 5            # 撒一下盖住左右几格
 SALT_REACH = MAT_STRIP + 4 # 离屏幕边多少格以内算撒在边缘菌毯上
 SALT_GLOOM = 4             # 被撒盐时它们掉多少快乐
 MAT_RECEDE = 0.3           # 全体饿扁时，边缘菌毯每次（MAT_TICK）退缩几步
+MAT_OFFLINE_RECEDE = 0.35  # 关掉程序期间最多退掉现有菌毯的多少：出门几天回来也还剩一截，能接着长
+SPITTER_DIES = 0.08        # 脚下菌毯退到这个占比以下，喷孢菌枯掉
 MOOD_NAMES = {"full": "", "hungry": "饿", "starving": "饿扁了", "dormant": "休眠"}
 
 DEVOUR = True              # 默认吞噬文件（右键菜单可关）

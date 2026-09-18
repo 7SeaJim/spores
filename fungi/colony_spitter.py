@@ -8,7 +8,8 @@ import time
 from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QApplication, QMenu
 
-from .config import HUNGRY_AT, MAT_SPROUT_DEPTH, MAX_COLONY, OUTCOME_NAMES, PX, SHOT_OUTCOMES, SPITTER_AT, SPITTER_EVERY
+from .config import (HUNGRY_AT, MAT_SPROUT_DEPTH, MAX_COLONY, OUTCOME_NAMES, PX, SHOT_OUTCOMES, SPITTER_AT, SPITTER_DIES,
+                     SPITTER_EVERY)
 from .ui import fmt_age, MENU_QSS
 from .spitter import EDGE_POSE, spitter_image, SpitterWidget, SporeShot
 
@@ -21,6 +22,9 @@ class SpitterMixin:
 
     def check_spitter(self, quiet: bool = False):
         if self.spitter:
+            f = self.spitter_field()
+            if f.mat.occupied() < SPITTER_DIES and not f.mat.d[self.spitter["i"] % f.mat.n]:
+                self.drop_spitter()                       # 脚下的菌毯退光了：不留一根光杆
             return
         for f in self.fields.values():                    # 主屏优先
             m = f.mat
@@ -32,6 +36,14 @@ class SpitterMixin:
                 cands.sort(key=lambda i: m.eff(i) + random.random() * 2, reverse=True)
                 self.plant_spitter(random.choice(cands[:20]), quiet, screen=f.key)
                 return
+
+    def drop_spitter(self):
+        self.spitter = None
+        if self.spitter_view:
+            self.spitter_view.close()
+            self.spitter_view = None
+        self.log_event("菌毯退光了，边上的喷孢菌也枯掉了")
+        self.save()
 
     def plant_spitter(self, i: int, quiet: bool = False, screen: str = ""):
         screen = screen if screen in self.fields else self.primary_key
